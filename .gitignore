@@ -1,0 +1,15 @@
+# build output (regenerated from src/)
+Citrus.exe
+*.exe
+src/Citrus.exe
+
+# scratch / temp
+*.tmp
+*.log
+sb.txt
+selfbuild.txt
+ziptest/
+extracted/
+out.zip
+
+/citrus.ico
