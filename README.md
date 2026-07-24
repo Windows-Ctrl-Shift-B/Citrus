@@ -43,12 +43,41 @@ Grab **[`Citrus.cmd`](Citrus.cmd)** — that one file *is* the whole app on ever
 
 ## ✨ What it does
 
-- **📊 See what's big** — folders sorted biggest-first, colored bars, live free-space readout, and a full **treemap** map view
-- **🔎 Hunt space hogs** — biggest files anywhere · big *old* files · **duplicate finder** (matched by content) · file-type breakdown · whole-drive name search
-- **🧹 Clean up** — junk cleaner (temp, caches, Recycle Bin) · Windows deep-clean (`Windows.old`, update cache) · empty-folder finder
-- **🗑️ Delete safely** — everything goes to the Recycle Bin / Trash · **system files are protected** · multi-select · undo
-- **🛠️ Power tools** — zip a folder · move a folder to another drive · installed-programs list · startup manager · drive health (SMART) · **PC specs sheet** · scan snapshots to compare over time
-- **🖱️ Mouse *and* keyboard** — scroll, click, or shortcut keys. Press **`?`** for help, **`T`** for tools.
+**Explore & find**
+- 📊 Folders sorted biggest-first with colored size bars, a live free-space readout, `%`-of-folder and last-modified columns
+- 🗺️ A **treemap** map view — click any block to jump into that folder
+- 🔎 Biggest files anywhere below a folder · big **old** files (untouched 1+ year)
+- 🧬 **Duplicate finder** — matches by content hash, shows reclaimable space
+- 🧾 File-type breakdown (video / photos / installers / …) · whole-drive **name search**
+- 🔀 Filter as you type · sort by size / name / newest
+
+**Clean up**
+- 🧹 **Junk cleaner** — temp files, browser caches, Recycle Bin
+- 🪟 **Windows deep-clean** — `Windows.old`, Update cache, Delivery Optimization, crash dumps
+- 📭 Empty-folder finder · 🔒 secure free-space wipe (`cipher`)
+- 🗑️ Everything deletes to the **Recycle Bin / Trash** — with **system-file protection**, **multi-select**, and **undo**
+- 🔓 Auto-closes an app that's locking a file so the delete goes through
+
+**System tools** *(press `T`)*
+- 📦 Installed programs by size (+ launch uninstaller) · 🧨 debloat preinstalled Store apps
+- 🚀 Startup manager · 💗 drive health (SMART) · 📋 **PC specs sheet** for listings
+- 🗜️ Zip a folder · 📁 move a folder to another drive · 📄 export report · 📸 snapshot & compare
+
+**How you drive it**
+- 🖱️ Full **mouse** support — scroll, click rows, click the buttons, click treemap blocks
+- ⌨️ …or all keyboard — arrows, `1`–`9`, `Space` to tick, `Del`, `?` help, `T` tools, `Q` quit
+
+## 🖥️ Command line
+
+Once on your `PATH`, `citrus` works from any terminal:
+
+```bash
+citrus                  # open, then pick a drive
+citrus D:\Games         # open straight at a folder
+citrus --biggest C:\    # print the biggest files under a path
+citrus --specs          # write a PC specs sheet to the Desktop
+citrus --help           # full usage
+```
 
 ## 🔨 Build from source (Windows)
 
