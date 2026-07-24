@@ -96,16 +96,22 @@ static class Strata
     [DllImport("kernel32.dll")]
     static extern bool GetNumberOfConsoleInputEvents(IntPtr h, out uint n);
 
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr templ);
+
     static IntPtr _hIn;
     static uint _savedMode;
+    const uint _mouseMode = ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT;
     static readonly INPUT_RECORD[] _buf = new INPUT_RECORD[1];
 
     static void EnableMouse()
     {
-        _hIn = GetStdHandle(STD_INPUT_HANDLE);
+        // Grab the *real* console input (CONIN$) so mouse events always arrive,
+        // even if stdin was redirected; fall back to the standard handle.
+        IntPtr h = CreateFile("CONIN$", 0x80000000u | 0x40000000u, 0x1u | 0x2u, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        _hIn = (h == INVALID || h == IntPtr.Zero) ? GetStdHandle(STD_INPUT_HANDLE) : h;
         GetConsoleMode(_hIn, out _savedMode);
-        SetConsoleMode(_hIn, ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT
-                             | ENABLE_WINDOW_INPUT | ENABLE_PROCESSED_INPUT);
+        SetConsoleMode(_hIn, _mouseMode);   // mouse ON; QuickEdit / line / echo OFF
     }
     static void RestoreMouse() { if (_hIn != IntPtr.Zero) SetConsoleMode(_hIn, _savedMode); }
 
@@ -114,6 +120,7 @@ static class Strata
 
     static Input ReadEvent()
     {
+        SetConsoleMode(_hIn, _mouseMode);   // re-assert every read so nothing disables the mouse
         while (true)
         {
             uint read;
@@ -1171,37 +1178,44 @@ static class Strata
 
     static ConsoleColor Col(char c)
     {
-        return c == 'g' ? ConsoleColor.DarkGreen : c == 'l' ? ConsoleColor.Green : c == 'c' ? ConsoleColor.Cyan : ConsoleColor.Black;
+        return c == 'r' ? ConsoleColor.DarkGreen   // rind
+             : c == 'f' ? ConsoleColor.Green        // flesh
+             : c == 'w' ? ConsoleColor.White        // segment lines / pith
+             : ConsoleColor.Black;
     }
 
     // the treemap logo rendered with half-block chars (so it looks like the
     // icon: green + lime squares, two teal squares) + CITRUS pixel letters.
     static void DrawLogo(int indent)
     {
-        // Solid full-block logo — each cell is a "██" pixel that renders the
-        // same in every console font (no half-block seams). g=green, l=lime,
-        // c=teal, .=blank. Matches the picture: green + lime squares, two teal.
-        string[] logo = {
-            "GGGGG.CCC.CCC",
-            "GGGGG.CCC.CCC",
-            "GGGGG.CCC.CCC",
-            "GGGGG........",
-            "GGGGG........",
-            ".............",
-            "LLLLL........",
-            "LLLLL........",
-            "LLLLL........",
-            "LLLLL........",
-            "LLLLL........",
+        // Citrus-slice logo, drawn with half-block chars for a smooth circle.
+        // r = rind, f = flesh, w = segment lines / pith, . = empty.
+        string[] slice = {
+            "....................",
+            "......rrrrrrrr......",
+            ".....rrffffffrr.....",
+            "....rrffffffffrr....",
+            "...rrfwffffffwfrr...",
+            "...rfffwffffwfffr...",
+            "...rffffwffwffffr...",
+            "...rfffffwwfffffr...",
+            "...rfffffwwfffffr...",
+            "...rffffwffwffffr...",
+            "...rfffwffffwfffr...",
+            "...rrfwffffffwfrr...",
+            "....rrffffffffrr....",
+            ".....rrffffffrr.....",
+            "......rrrrrrrr......",
+            "....................",
         };
-        foreach (var row in logo)
+        for (int cr = 0; cr < slice.Length / 2; cr++)
         {
             Console.Write(new string(' ', indent));
-            foreach (char c in row)
+            for (int x = 0; x < slice[0].Length; x++)
             {
-                if (c == '.') { Console.Write("  "); continue; }
-                Console.ForegroundColor = c == 'G' ? ConsoleColor.DarkGreen : c == 'L' ? ConsoleColor.Green : ConsoleColor.Cyan;
-                Console.Write("██");
+                char top = slice[2 * cr][x], bot = slice[2 * cr + 1][x];
+                if (top == '.' && bot == '.') { Console.ResetColor(); Console.Write(' '); }
+                else { Console.ForegroundColor = Col(top); Console.BackgroundColor = Col(bot); Console.Write('▀'); }
             }
             Console.ResetColor(); Console.WriteLine();
         }
@@ -1241,6 +1255,8 @@ static class Strata
         ConsoleColor.Green, ConsoleColor.Cyan, ConsoleColor.Blue, ConsoleColor.Magenta
     };
 
+    static List<KeyValuePair<Entry, int[]>> _treeRegions;  // block -> {x0,y0,x1,y1} for clicks
+
     static void FillBlock(string label, int x, int y, int w, int h, ConsoleColor bg)
     {
         if (w <= 0 || h <= 0) return;
@@ -1266,6 +1282,7 @@ static class Strata
         if (items.Count == 1)
         {
             FillBlock(items[0].Name + "  " + Human(items[0].Size), x, y, w, h, TreeColors[ci[0]++ % TreeColors.Length]);
+            if (_treeRegions != null) _treeRegions.Add(new KeyValuePair<Entry, int[]>(items[0], new[] { x, y, x + w - 1, y + h - 1 }));
             return;
         }
         long total = 0; foreach (var e in items) total += e.Size;
@@ -1296,16 +1313,39 @@ static class Strata
         var items = new List<Entry>();
         foreach (var e in View) if (e.Size > 0) items.Add(e);
         items.Sort((a, b) => b.Size.CompareTo(a.Size));
-        Console.ResetColor(); Console.Clear();
-        int cols = Cols, rows = Rows;
-        Console.BackgroundColor = ConsoleColor.DarkBlue; Console.ForegroundColor = ConsoleColor.White;
-        Line(" CITRUS — map of " + CurrentPath); Console.ResetColor();
-        if (items.Count == 0) { Console.WriteLine(" (nothing to map)"); }
-        else { int[] ci = { 0 }; DrawTree(items, 0, 2, cols - 1, rows - 3, true, ci); }
-        Console.SetCursorPosition(0, rows - 1);
-        Console.BackgroundColor = ConsoleColor.DarkGray; Console.ForegroundColor = ConsoleColor.White;
-        Console.Write(Fit(" Biggest folders/files as blocks — press any key to go back", cols - 1)); Console.ResetColor();
-        ReadEvent();
+        while (true)
+        {
+            Console.ResetColor(); Console.Clear();
+            int cols = Cols, rows = Rows;
+            Console.BackgroundColor = ConsoleColor.DarkBlue; Console.ForegroundColor = ConsoleColor.White;
+            Line(" CITRUS — map of " + CurrentPath); Console.ResetColor();
+            _treeRegions = new List<KeyValuePair<Entry, int[]>>();
+            if (items.Count == 0) { Console.WriteLine(" (nothing to map)"); }
+            else { int[] ci = { 0 }; DrawTree(items, 0, 2, cols - 1, rows - 3, true, ci); }
+            Console.SetCursorPosition(0, rows - 1);
+            Console.BackgroundColor = ConsoleColor.DarkGray; Console.ForegroundColor = ConsoleColor.White;
+            Console.Write(Fit(" Click a block to open it · any key to go back", cols - 1)); Console.ResetColor();
+
+            var ev = ReadEvent();
+            if (ev.Kind == Ev.Resize) continue;
+            if (ev.Kind == Ev.Click)
+            {
+                Entry hit = null;
+                foreach (var kv in _treeRegions)
+                {
+                    var r = kv.Value;
+                    if (ev.X >= r[0] && ev.X <= r[2] && ev.Y >= r[1] && ev.Y <= r[3]) { hit = kv.Key; break; }
+                }
+                if (hit != null)
+                {
+                    string full = Path.Combine(CurrentPath, hit.Name);
+                    if (hit.IsDir) { CurrentPath = full; ScanScreen(false); return; }   // open folder in the app
+                    else { try { Process.Start(new ProcessStartInfo(full) { UseShellExecute = true }); } catch { } }
+                }
+                continue;   // click on a file or empty space — stay on the map
+            }
+            return;   // any key exits the map
+        }
     }
 
     static readonly Dictionary<string, string> ExtCat = BuildExtCat();
@@ -1508,6 +1548,7 @@ static class Strata
             Console.SetCursorPosition(0, r - 1); Console.ForegroundColor = ConsoleColor.Green; Console.Write(Fit(" " + progs.Count + " programs   (Esc back)", cols - 1)); Console.ResetColor();
             var ev = ReadEvent();
             if (ev.Kind == Ev.Wheel) { sel = ev.WheelUp ? Math.Max(0, sel - 1) : Math.Min(Math.Max(0, progs.Count - 1), sel + 1); continue; }
+            if (ev.Kind == Ev.Click) { if (ev.Y >= 3 && ev.Y < 3 + lr) { int ci = off + (ev.Y - 3); if (ci < progs.Count) sel = ci; } continue; }
             if (ev.Kind != Ev.Key) continue;
             if (ev.VK == 0x1B) return;
             else if (ev.VK == 0x26) { if (sel > 0) sel--; }
@@ -1786,6 +1827,7 @@ static class Strata
                 else W("   " + present[i][0] + "\n", ConsoleColor.White);
             }
             var ev = ReadEvent();
+            if (ev.Kind == Ev.Click) { if (ev.Y >= 3 && ev.Y < 3 + present.Count) sel = ev.Y - 3; continue; }
             if (ev.Kind != Ev.Key) continue;
             if (ev.VK == 0x1B) return;
             else if (ev.VK == 0x26) { if (sel > 0) sel--; }
@@ -1983,6 +2025,8 @@ static class Strata
             }
             Console.SetCursorPosition(0, r - 1); Console.ForegroundColor = ConsoleColor.Green; Console.Write(Fit(" " + entries.Count + " startup entries   (Esc back)", cols - 1)); Console.ResetColor();
             var ev = ReadEvent();
+            if (ev.Kind == Ev.Wheel) { sel = ev.WheelUp ? Math.Max(0, sel - 1) : Math.Min(Math.Max(0, entries.Count - 1), sel + 1); continue; }
+            if (ev.Kind == Ev.Click) { if (ev.Y >= 3 && ev.Y < 3 + lr) { int ci = off + (ev.Y - 3); if (ci < entries.Count) sel = ci; } continue; }
             if (ev.Kind != Ev.Key) continue;
             if (ev.VK == 0x1B) return;
             else if (ev.VK == 0x26) { if (sel > 0) sel--; }
@@ -2390,6 +2434,47 @@ static class Strata
             return 0;
         }
 
+        // -------- command-line flags --------
+        if (args.Length >= 1 && (args[0] == "-h" || args[0] == "--help" || args[0] == "/?"))
+        {
+            Console.WriteLine("Citrus - disk usage explorer & cleanup tool");
+            Console.WriteLine();
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  citrus                  open, then pick a drive");
+            Console.WriteLine("  citrus <folder>         open straight at that folder");
+            Console.WriteLine("  citrus --biggest <p>    print the biggest files under <p>");
+            Console.WriteLine("  citrus --specs          write a PC specs sheet to the Desktop");
+            Console.WriteLine("  citrus --version        show version");
+            Console.WriteLine("  citrus --help           this help");
+            Console.WriteLine();
+            Console.WriteLine("In the app: ? = help  ·  T = tools  ·  arrows/scroll/click to move");
+            return 0;
+        }
+        if (args.Length >= 1 && (args[0] == "-v" || args[0] == "--version"))
+        {
+            Console.WriteLine("Citrus 1.0  (by Noah - github.com/Windows-Ctrl-Shift-B)");
+            return 0;
+        }
+        if (args.Length >= 1 && args[0] == "--specs")
+        {
+            SpecsSheet();
+            Console.WriteLine(Status.Length > 0 ? Status.TrimStart('!', ' ', (char)0x2713) : "Specs written to Desktop.");
+            return Status.StartsWith("!") ? 1 : 0;
+        }
+        if (args.Length == 2 && args[0] == "--biggest")
+        {
+            var files = new List<KeyValuePair<string, long>>();
+            int[] dirs = { 0 };
+            CollectFiles(args[1], 1024L * 1024, files, dirs);
+            files.Sort((a, b) => b.Value.CompareTo(a.Value));
+            int n = Math.Min(30, files.Count);
+            for (int i = 0; i < n; i++) Console.WriteLine(Human(files[i].Value).PadLeft(11) + "  " + files[i].Key);
+            return 0;
+        }
+        // open straight at a folder if one is passed:  citrus D:\Games
+        string startPath = null;
+        if (args.Length >= 1 && !args[0].StartsWith("-") && Directory.Exists(args[0])) startPath = Path.GetFullPath(args[0]);
+
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
         try { Console.CursorVisible = false; } catch { }
         Console.Title = "Citrus — Disk Usage Explorer";
@@ -2410,7 +2495,7 @@ static class Strata
 
         try
         {
-            string drive = ChooseDrive();
+            string drive = startPath != null ? startPath : ChooseDrive();
             if (drive == null) return 0;
             CurrentPath = drive;
             ScanScreen(false);
@@ -2429,7 +2514,7 @@ static class Strata
                 {
                     if (ev.Y >= ListTop && ev.Y < ListTop + ListRows)
                         OpenIndex(Offset + (ev.Y - ListTop));
-                    else if (ev.Y == FooterY)
+                    else if (ev.Y >= FooterY - 1)   // footer row (tolerant of an off-by-one click)
                     {
                         char act = '\0';
                         foreach (var b in Buttons) if (ev.X >= b.X0 && ev.X <= b.X1) { act = b.Act; break; }

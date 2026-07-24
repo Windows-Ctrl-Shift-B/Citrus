@@ -1208,15 +1208,45 @@ class App:
 
     @staticmethod
     def draw_logo(indent):
-        logo = ["GGGGG.CCC.CCC", "GGGGG.CCC.CCC", "GGGGG.CCC.CCC",
-                "GGGGG........", "GGGGG........", ".............",
-                "LLLLL........", "LLLLL........", "LLLLL........",
-                "LLLLL........", "LLLLL........"]
-        colmap = {"G": "38;5;34", "L": "38;5;70", "C": "38;5;44"}
-        for row in logo:
+        # citrus-slice logo, drawn with half-block chars for a smooth circle
+        slice_art = [
+            "....................",
+            "......rrrrrrrr......",
+            ".....rrffffffrr.....",
+            "....rrffffffffrr....",
+            "...rrfwffffffwfrr...",
+            "...rfffwffffwfffr...",
+            "...rffffwffwffffr...",
+            "...rfffffwwfffffr...",
+            "...rfffffwwfffffr...",
+            "...rffffwffwffffr...",
+            "...rfffwffffwfffr...",
+            "...rrfwffffffwfrr...",
+            "....rrffffffffrr....",
+            ".....rrffffffrr.....",
+            "......rrrrrrrr......",
+            "....................",
+        ]
+        code = {"r": "22", "f": "149", "w": "231"}  # rind / flesh / segments
+        for cr in range(len(slice_art) // 2):
             line = " " * indent
-            for ch in row:
-                line += "  " if ch == "." else c(colmap[ch], "██")
+            for x in range(len(slice_art[0])):
+                t = slice_art[2 * cr][x]
+                b = slice_art[2 * cr + 1][x]
+                tf = code.get(t)
+                bf = code.get(b)
+                if not ANSI:
+                    line += "  " if (not tf and not bf) else "██"
+                elif not tf and not bf:
+                    line += " "
+                elif tf and bf and t == b:
+                    line += "\x1b[38;5;" + tf + "m█\x1b[0m"
+                elif tf and bf:
+                    line += "\x1b[38;5;" + tf + "m\x1b[48;5;" + bf + "m▀\x1b[0m"
+                elif tf:
+                    line += "\x1b[38;5;" + tf + "m▀\x1b[0m"
+                else:
+                    line += "\x1b[38;5;" + bf + "m▄\x1b[0m"
             print(line)
         print()
         font = {"C": ["###", "#..", "#..", "#..", "###"],
