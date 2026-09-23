@@ -13,6 +13,7 @@ import os
 import sys
 import shutil
 import hashlib
+import heapq
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -504,9 +505,10 @@ class App:
 
     # ----- collect / biggest / dupes -----
 
-    def collect(self, min_size, progress):
+    def collect(self, min_size, progress, limit=0):
         files = []
         dirs = 0
+        found = 0
         stack = [self.path]
         while stack:
             if self.cancel.is_set():
@@ -524,13 +526,24 @@ class App:
                             else:
                                 sz = e.stat(follow_symlinks=False).st_size
                                 if sz >= min_size:
-                                    files.append((e.path, sz))
+                                    found += 1
+                                    if limit <= 0:
+                                        files.append((e.path, sz))
+                                    else:
+                                        # Keep earlier matches on ties, as the stable sort did.
+                                        item = (sz, -found, e.path)
+                                        if len(files) < limit:
+                                            heapq.heappush(files, item)
+                                        elif item > files[0]:
+                                            heapq.heapreplace(files, item)
                         except OSError:
                             continue
             except OSError:
                 continue
             if dirs % 40 == 0:
-                progress(dirs, len(files))
+                progress(dirs, found)
+        if limit > 0:
+            return [(path, sz) for sz, _, path in sorted(files, reverse=True)]
         return files
 
     def list_screen(self, title, rows):
@@ -598,9 +611,8 @@ class App:
             sys.stdout.flush()
             if esc_pressed():
                 self.cancel.set()
-        files = self.collect(1024 * 1024, prog)
-        files.sort(key=lambda kv: kv[1], reverse=True)
-        self.list_screen("CITRUS - biggest files (top 500, >= 1 MB)", files[:500])
+        files = self.collect(1024 * 1024, prog, limit=500)
+        self.list_screen("CITRUS - biggest files (top 500, >= 1 MB)", files)
 
     def duplicates(self):
         clear()

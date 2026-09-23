@@ -959,7 +959,39 @@ static class Strata
     }
 
     // recursively collect files at/under root (only >= minSize, junction-safe)
-    static void CollectFiles(string root, long minSize, List<KeyValuePair<string, long>> outFiles, int[] dirsDone)
+    // A min-heap keeps only the largest limit entries, in O(log limit) per match.
+    // Equal sizes keep the existing entry; callers sort the final small result.
+    static void KeepLargest(List<KeyValuePair<string, long>> files, string path, long size, int limit)
+    {
+        var item = new KeyValuePair<string, long>(path, size);
+        if (limit <= 0) { files.Add(item); return; }
+        if (files.Count < limit)
+        {
+            int i = files.Count;
+            files.Add(item);
+            while (i > 0)
+            {
+                int parent = (i - 1) / 2;
+                if (files[parent].Value <= size) break;
+                files[i] = files[parent]; i = parent;
+            }
+            files[i] = item;
+        }
+        else if (size > files[0].Value)
+        {
+            int i = 0;
+            while (i * 2 + 1 < files.Count)
+            {
+                int child = i * 2 + 1;
+                if (child + 1 < files.Count && files[child + 1].Value < files[child].Value) child++;
+                if (files[child].Value >= size) break;
+                files[i] = files[child]; i = child;
+            }
+            files[i] = item;
+        }
+    }
+
+    static void CollectFiles(string root, long minSize, List<KeyValuePair<string, long>> outFiles, int[] dirsDone, int limit = 0)
     {
         var stack = new Stack<string>();
         stack.Push(root);
@@ -983,7 +1015,7 @@ static class Strata
                     else
                     {
                         long sz = ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                        if (sz >= minSize) outFiles.Add(new KeyValuePair<string, long>(full, sz));
+                        if (sz >= minSize) KeepLargest(outFiles, full, sz, limit);
                     }
                 } while (FindNextFile(h, out fd));
             }
@@ -1083,11 +1115,10 @@ static class Strata
         CancelScan = false;
         var files = new List<KeyValuePair<string, long>>();
         int[] dirs = { 0 };
-        var t = Task.Factory.StartNew(() => CollectFiles(CurrentPath, 1024L * 1024, files, dirs)); // >= 1 MB
-        while (!t.IsCompleted) { ProgressLine("Scanning for big files… " + dirs[0] + " folders, " + files.Count + " found"); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(60); }
+        var t = Task.Factory.StartNew(() => CollectFiles(CurrentPath, 1024L * 1024, files, dirs, 500)); // >= 1 MB
+        while (!t.IsCompleted) { ProgressLine("Scanning for big files… " + dirs[0] + " folders, top " + files.Count + " retained"); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(60); }
         try { t.Wait(); } catch { }
         files.Sort((a, b) => b.Value.CompareTo(a.Value));
-        if (files.Count > 500) files = files.GetRange(0, 500);
         ListScreen("CITRUS — biggest files (top " + files.Count + ", ≥ 1 MB)", files, "No files ≥ 1 MB here.");
     }
 
@@ -1891,7 +1922,7 @@ static class Strata
     // Minimal .zip writer using only DeflateStream (in System.dll since .NET 2.0),
     // so it works on Windows 7 / Vista / XP without the .NET 4.5 zip assemblies.
     static uint[] _crc;
-    static uint Crc32(byte[] data)
+    static uint Crc32(uint c, byte[] data, int count)
     {
         if (_crc == null)
         {
@@ -1903,9 +1934,8 @@ static class Strata
                 _crc[i] = x;
             }
         }
-        uint c = 0xFFFFFFFF;
-        for (int i = 0; i < data.Length; i++) c = _crc[(c ^ data[i]) & 0xFF] ^ (c >> 8);
-        return c ^ 0xFFFFFFFF;
+        for (int i = 0; i < count; i++) c = _crc[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        return c;
     }
     static void W16(Stream s, int v) { s.WriteByte((byte)(v & 0xFF)); s.WriteByte((byte)((v >> 8) & 0xFF)); }
     static void W32(Stream s, uint v) { s.WriteByte((byte)v); s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)(v >> 16)); s.WriteByte((byte)(v >> 24)); }
@@ -1934,34 +1964,59 @@ static class Strata
         using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write))
         {
             var central = new List<byte[]>();
+            // Reuse one buffer instead of holding the input and compressed file in RAM.
+            var buffer = new byte[65536];
             foreach (var name in rel)
             {
-                byte[] data;
-                try { data = File.ReadAllBytes(Path.Combine(baseDir, name)); } catch { continue; }
-                uint crc = Crc32(data);
-                byte[] comp;
-                using (var ms = new MemoryStream())
+                FileStream input;
+                try { input = new FileStream(Path.Combine(baseDir, name), FileMode.Open, FileAccess.Read, FileShare.Read, buffer.Length, FileOptions.SequentialScan); }
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
+                using (input)
                 {
-                    using (var dz = new DeflateStream(ms, CompressionMode.Compress, true)) dz.Write(data, 0, data.Length);
-                    comp = ms.ToArray();
-                }
-                byte[] nb = System.Text.Encoding.UTF8.GetBytes(name.Replace('\\', '/'));
-                uint localOffset = (uint)fs.Position;
-                W32(fs, 0x04034b50); W16(fs, 20); W16(fs, 0x0800); W16(fs, 8); W16(fs, 0); W16(fs, 0);
-                W32(fs, crc); W32(fs, (uint)comp.Length); W32(fs, (uint)data.Length);
-                W16(fs, nb.Length); W16(fs, 0);
-                fs.Write(nb, 0, nb.Length);
-                fs.Write(comp, 0, comp.Length);
+                    if (input.Length >= uint.MaxValue || fs.Position >= uint.MaxValue || central.Count >= ushort.MaxValue)
+                        throw new IOException("This archive exceeds the supported ZIP32 size or entry limit.");
+                    byte[] nb = System.Text.Encoding.UTF8.GetBytes(name.Replace('\\', '/'));
+                    if (nb.Length > ushort.MaxValue) throw new IOException("ZIP entry name is too long.");
+                    uint localOffset = (uint)fs.Position;
+                    W32(fs, 0x04034b50); W16(fs, 20); W16(fs, 0x0800); W16(fs, 8); W16(fs, 0); W16(fs, 0);
+                    W32(fs, 0); W32(fs, 0); W32(fs, 0); // filled after streaming
+                    W16(fs, nb.Length); W16(fs, 0);
+                    fs.Write(nb, 0, nb.Length);
+                    long dataStart = fs.Position, size = 0;
+                    uint crc = 0xFFFFFFFF;
+                    using (var dz = new DeflateStream(fs, CompressionMode.Compress, true))
+                    {
+                        int count;
+                        while ((count = input.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            size += count;
+                            if (size >= uint.MaxValue) throw new IOException("File exceeds the supported ZIP32 size limit.");
+                            crc = Crc32(crc, buffer, count);
+                            dz.Write(buffer, 0, count);
+                        }
+                    }
+                    crc ^= 0xFFFFFFFF;
+                    long end = fs.Position;
+                    if (end >= uint.MaxValue) throw new IOException("Archive exceeds the supported ZIP32 size limit.");
+                    uint compressedSize = (uint)(end - dataStart);
+                    fs.Position = localOffset + 14L;
+                    W32(fs, crc); W32(fs, compressedSize); W32(fs, (uint)size);
+                    fs.Position = end;
 
-                var cd = new MemoryStream();
-                W32(cd, 0x02014b50); W16(cd, 20); W16(cd, 20); W16(cd, 0x0800); W16(cd, 8); W16(cd, 0); W16(cd, 0);
-                W32(cd, crc); W32(cd, (uint)comp.Length); W32(cd, (uint)data.Length);
-                W16(cd, nb.Length); W16(cd, 0); W16(cd, 0); W16(cd, 0); W16(cd, 0); W32(cd, 0); W32(cd, localOffset);
-                cd.Write(nb, 0, nb.Length);
-                central.Add(cd.ToArray());
+                    using (var cd = new MemoryStream())
+                    {
+                        W32(cd, 0x02014b50); W16(cd, 20); W16(cd, 20); W16(cd, 0x0800); W16(cd, 8); W16(cd, 0); W16(cd, 0);
+                        W32(cd, crc); W32(cd, compressedSize); W32(cd, (uint)size);
+                        W16(cd, nb.Length); W16(cd, 0); W16(cd, 0); W16(cd, 0); W16(cd, 0); W32(cd, 0); W32(cd, localOffset);
+                        cd.Write(nb, 0, nb.Length);
+                        central.Add(cd.ToArray());
+                    }
+                }
             }
             uint cdStart = (uint)fs.Position;
             foreach (var b in central) fs.Write(b, 0, b.Length);
+            if (fs.Position >= uint.MaxValue) throw new IOException("Archive exceeds the supported ZIP32 size limit.");
             uint cdSize = (uint)fs.Position - cdStart;
             W32(fs, 0x06054b50); W16(fs, 0); W16(fs, 0); W16(fs, central.Count); W16(fs, central.Count);
             W32(fs, cdSize); W32(fs, cdStart); W16(fs, 0);
@@ -2465,7 +2520,7 @@ static class Strata
         {
             var files = new List<KeyValuePair<string, long>>();
             int[] dirs = { 0 };
-            CollectFiles(args[1], 1024L * 1024, files, dirs);
+            CollectFiles(args[1], 1024L * 1024, files, dirs, 30);
             files.Sort((a, b) => b.Value.CompareTo(a.Value));
             int n = Math.Min(30, files.Count);
             for (int i = 0; i < n; i++) Console.WriteLine(Human(files[i].Value).PadLeft(11) + "  " + files[i].Key);

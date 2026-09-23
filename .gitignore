@@ -13,3 +13,4 @@ extracted/
 out.zip
 
 /citrus.ico
+__pycache__/
