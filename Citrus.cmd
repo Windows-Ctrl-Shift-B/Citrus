@@ -16,7 +16,7 @@ exit /b
 //
 // Mouse + keyboard. Scroll to move, click or press 1-9 to open a folder,
 // filter by name, sort, open in Explorer, and a built-in junk cleaner.
-// Deletes go to the Recycle Bin and system files are protected.
+// Deletes go to the Recycle Bin. Nothing is off-limits — anything can be deleted.
 
 using System;
 using System.Collections.Generic;
@@ -328,11 +328,9 @@ static class Strata
     }
     static bool IsProtected(string p)
     {
-        if (IsDriveRoot(p)) return true;
-        foreach (var seg in p.Split('\\'))
-            if (seg.Length > 0 && ProtectedNames.Contains(seg)) return true;
-        uint a = GetFileAttributes(@"\\?\" + p.TrimEnd('\\'));
-        if (a != 0xFFFFFFFF && (a & FA_SYSTEM) != 0) return true;
+        // Protection removed by request: Citrus will delete anything, including
+        // Windows and system files. Deletes still go to the Recycle Bin where
+        // possible, so most things can be restored — but use with care.
         return false;
     }
     static string Fit(string s, int w)
@@ -2655,7 +2653,7 @@ Citrus — a disk usage explorer for the terminal (macOS / Linux / Windows).
 
 Keyboard-driven, no install beyond Python 3. Navigate, filter, sort, find
 the biggest files, find duplicates, a junk cleaner, a help screen,
-multi-select, and safe delete to the trash with system-file protection.
+multi-select, and delete to the trash — nothing is off-limits.
 
 Run:  python3 strata.py     (or double-click Citrus.command on a Mac)
 """
@@ -2807,11 +2805,9 @@ def is_drive_root(p):
 
 
 def is_protected(p):
-    if is_drive_root(p):
-        return True
-    for seg in os.path.abspath(p).split(os.sep):
-        if seg and seg.lower() in PROTECTED:
-            return True
+    # Protection removed by request: Citrus will delete anything, including
+    # system files. Deletes still go to the trash where possible, so most
+    # things can be restored — but use with care.
     return False
 
 

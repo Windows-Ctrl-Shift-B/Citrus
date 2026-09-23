@@ -5,7 +5,7 @@
 //
 // Mouse + keyboard. Scroll to move, click or press 1-9 to open a folder,
 // filter by name, sort, open in Explorer, and a built-in junk cleaner.
-// Deletes go to the Recycle Bin and system files are protected.
+// Deletes go to the Recycle Bin. Nothing is off-limits — anything can be deleted.
 
 using System;
 using System.Collections.Generic;
@@ -317,11 +317,9 @@ static class Strata
     }
     static bool IsProtected(string p)
     {
-        if (IsDriveRoot(p)) return true;
-        foreach (var seg in p.Split('\\'))
-            if (seg.Length > 0 && ProtectedNames.Contains(seg)) return true;
-        uint a = GetFileAttributes(@"\\?\" + p.TrimEnd('\\'));
-        if (a != 0xFFFFFFFF && (a & FA_SYSTEM) != 0) return true;
+        // Protection removed by request: Citrus will delete anything, including
+        // Windows and system files. Deletes still go to the Recycle Bin where
+        // possible, so most things can be restored — but use with care.
         return false;
     }
     static string Fit(string s, int w)
