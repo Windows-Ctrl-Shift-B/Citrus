@@ -89,6 +89,24 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 The `Citrus.cmd` one-file build is just `src/poly_header.txt` + the C# (between `#<CS>`…`#</CS>`) + the Python (between `#<PY>`…`#</PY>`) stitched into one polyglot.
 
+After editing the sources, regenerate it with `powershell -ExecutionPolicy Bypass -File package.ps1`.
+Run the regression checks with `python -m unittest discover -s tests -v`.
+Windows checks compile with the built-in .NET Framework compiler; other platforms run the Python checks.
+
+### Memory and disk usage
+
+Biggest-file searches retain at most 500 results (30 for the Windows command line),
+instead of collecting every matching file. Duplicate searches still examine all candidates.
+The Windows ZIP writer streams through a reusable 64 KiB buffer, so file contents no
+longer have to fit in RAM. File names and ZIP directory metadata still scale with the
+number of entries. ZIP64 is not supported; oversized archives fail with a size-limit error.
+
+The Windows launcher keeps only the compiled executable in `%LOCALAPPDATA%\Citrus`.
+It removes extracted source and icon files, including leftovers from older versions,
+and reads the embedded source only when recompilation is needed.
+
+For reproducible before/after measurements, see [tests/benchmark_memory.py](tests/benchmark_memory.py).
+
 ## 📂 Layout
 
 ```text
