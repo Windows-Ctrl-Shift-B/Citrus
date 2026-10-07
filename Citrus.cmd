@@ -580,17 +580,207 @@ static class Strata
         try { return DateTime.FromFileTime(ft).ToString("yyyy-MM-dd"); } catch { return ""; }
     }
 
-    static bool RecycleOne(string target)
+    // ------------------------------------------------------------ deleting --
+    // Recycle Bin first (shell call, never shows a dialog); a direct Win32
+    // delete for anything the bin can't take. Every function here returns
+    // null on success, or a short reason on failure.
+
+    [DllImport("kernel32.dll", EntryPoint = "DeleteFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Win32DeleteFile(string path);
+    [DllImport("kernel32.dll", EntryPoint = "RemoveDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Win32RemoveDirectory(string path);
+    [DllImport("kernel32.dll", EntryPoint = "SetFileAttributesW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Win32SetAttributes(string path, uint attrs);
+    [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool Win32MoveFileEx(string from, string to, int flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetVolumeNameForVolumeMountPoint(string mountPoint, System.Text.StringBuilder volName, uint len);
+
+    // SHFILEOPSTRUCT is packed differently on 32-bit and 64-bit Windows.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SHFILEOP64 { public IntPtr hwnd; public uint wFunc; public string pFrom, pTo; public ushort fFlags; public bool aborted; public IntPtr names; public string title; }
+    [StructLayout(LayoutKind.Sequential, Pack = 1, CharSet = CharSet.Unicode)]
+    struct SHFILEOP32 { public IntPtr hwnd; public uint wFunc; public string pFrom, pTo; public ushort fFlags; public bool aborted; public IntPtr names; public string title; }
+    [DllImport("shell32.dll", EntryPoint = "SHFileOperationW", CharSet = CharSet.Unicode)]
+    static extern int SHFileOperation64(ref SHFILEOP64 op);
+    [DllImport("shell32.dll", EntryPoint = "SHFileOperationW", CharSet = CharSet.Unicode)]
+    static extern int SHFileOperation32(ref SHFILEOP32 op);
+
+    static string LongPath(string p)
+    {
+        if (p.StartsWith(@"\\?\")) return p;
+        if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
+        return @"\\?\" + p;
+    }
+    static bool PathExists(string p) { return GetFileAttributes(LongPath(p)) != 0xFFFFFFFF; }
+
+    static string Win32Reason(int e)
+    {
+        switch (e)
+        {
+            case 5: return "access denied";
+            case 32: case 33: return "in use by another program";
+            case 19: return "disk is write-protected";
+            case 145: return "folder not empty";
+            case 1224: return "open in a running program";
+            default: return "Windows error " + e;
+        }
+    }
+
+    // Moves one file/folder to the Recycle Bin. FOF_ALLOWUNDO | NOCONFIRMATION |
+    // SILENT | NOERRORUI | NOCONFIRMMKDIR, so it can never pop a hidden dialog.
+    static string RecycleOne(string target)
     {
         try
         {
-            if (Directory.Exists(target))
-                Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(target, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+            string from = (target.Length > 3 ? target.TrimEnd('\\') : target) + "\0";   // list is double-NUL terminated
+            int rc; bool aborted;
+            if (IntPtr.Size == 8)
+            {
+                var op = new SHFILEOP64 { wFunc = 3, pFrom = from, fFlags = 0x654 };
+                rc = SHFileOperation64(ref op); aborted = op.aborted;
+            }
             else
-                Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(target, Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs, Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+            {
+                var op = new SHFILEOP32 { wFunc = 3, pFrom = from, fFlags = 0x654 };
+                rc = SHFileOperation32(ref op); aborted = op.aborted;
+            }
+            if (rc == 0 && !aborted && !PathExists(target)) return null;
+            if (rc == 0x78 || rc == 5) return "access denied";
+            if (rc == 32 || rc == 33) return "in use by another program";
+            return "couldn't be moved to the Recycle Bin (code 0x" + rc.ToString("X") + ")";
+        }
+        catch (Exception e) { return e.Message; }
+    }
+
+    // Why a delete of `size` bytes at `path` would NOT land in the Recycle Bin
+    // (so it would be permanent) — or null if it will be restorable.
+    static string NoBinReason(string path, long size)
+    {
+        if (path.Length >= 250) return "path too long for the Recycle Bin";
+        try
+        {
+            string root = Path.GetPathRoot(path);
+            if (new DriveInfo(root).DriveType != DriveType.Fixed) return "this drive has no Recycle Bin";
+            var sb = new System.Text.StringBuilder(64);
+            if (!GetVolumeNameForVolumeMountPoint(root, sb, 64)) return null;
+            string vol = sb.ToString();
+            int i = vol.IndexOf('{'), j = vol.IndexOf('}');
+            if (i < 0 || j < i) return null;
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\" + vol.Substring(i, j - i + 1)))
+            {
+                if (k == null) return null;
+                object nuke = k.GetValue("NukeOnDelete"), cap = k.GetValue("MaxCapacity");
+                if (nuke is int && (int)nuke != 0) return "Recycle Bin is set to delete immediately on this drive";
+                if (cap is int && size > (long)(int)cap * 1024 * 1024) return "bigger than the Recycle Bin limit (" + (int)cap + " MB)";
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Post-order walk (children before parents). act(\\?\path, isDir) runs on every
+    // entry; links/junctions are acted on as links and never followed. Returns the
+    // first error reason, or null. Holds only the pending folders, never file lists.
+    static string WalkTree(string root, Func<string, bool, string> act)
+    {
+        string first = null;
+        var stack = new Stack<KeyValuePair<string, bool>>();
+        stack.Push(new KeyValuePair<string, bool>(root, false));
+        while (stack.Count > 0)
+        {
+            var cur = stack.Pop();
+            if (cur.Value) { string e = act(cur.Key, true); if (e != null && first == null) first = e; continue; }
+            if (CancelScan) return first ?? "stopped";
+            stack.Push(new KeyValuePair<string, bool>(cur.Key, true));   // removed after its children
+            string dir = cur.Key.TrimEnd('\\');
+            WIN32_FIND_DATA fd;
+            IntPtr h = FindFirstFileEx(dir + @"\*", 1, out fd, 0, IntPtr.Zero, 2);
+            if (h == INVALID) continue;
+            try
+            {
+                do
+                {
+                    string n = fd.cFileName;
+                    if (n == "." || n == "..") continue;
+                    bool isDir = (fd.dwFileAttributes & FA_DIR) != 0;
+                    if (isDir && (fd.dwFileAttributes & FA_REPARSE) == 0) stack.Push(new KeyValuePair<string, bool>(dir + "\\" + n, false));
+                    else { string e = act(dir + "\\" + n, isDir); if (e != null && first == null) first = e; }
+                } while (FindNextFile(h, out fd));
+            }
+            finally { FindClose(h); }
+        }
+        return first;
+    }
+
+    static string RemoveTree(string target, Func<string, bool, string> act)
+    {
+        string lp = LongPath(target.Length > 3 ? target.TrimEnd('\\') : target);
+        uint a = GetFileAttributes(lp);
+        if (a == 0xFFFFFFFF) return null;                       // already gone
+        bool dir = (a & FA_DIR) != 0;
+        if (dir && (a & FA_REPARSE) == 0) return WalkTree(lp, act);
+        return act(lp, dir);
+    }
+
+    // Clears read-only/hidden/system first, then deletes — works on long paths,
+    // trailing-dot/reserved names, and read-only files.
+    static string KillOne(string lp, bool dir)
+    {
+        Win32SetAttributes(lp, 0x80);
+        if (dir ? Win32RemoveDirectory(lp) : Win32DeleteFile(lp)) return null;
+        int e = Marshal.GetLastWin32Error();
+        return (e == 2 || e == 3) ? null : Win32Reason(e);
+    }
+    // Registers a delete for the next restart (needs Administrator). MOVEFILE_DELAY_UNTIL_REBOOT.
+    static string RebootOne(string lp, bool dir)
+    {
+        if (Win32MoveFileEx(lp, null, 4)) return null;
+        return Win32Reason(Marshal.GetLastWin32Error());
+    }
+    static string ForceDelete(string target) { return RemoveTree(target, KillOne); }
+    static string ScheduleAtRestart(string target) { return RemoveTree(target, RebootOne); }
+
+    static bool IsAdmin()
+    {
+        try { return new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent()).IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator); }
+        catch { return false; }
+    }
+    // Admin only: take ownership and grant Administrators full control, so
+    // files owned by SYSTEM/TrustedInstaller or another user can be removed.
+    static void TakeOwnership(string target)
+    {
+        bool dir = Directory.Exists(target);
+        string[][] cmds =
+        {
+            new[] { "takeown.exe", "/f \"" + target + "\"" + (dir ? " /r /d y" : "") },
+            new[] { "icacls.exe", "\"" + target + "\" /grant *S-1-5-32-544:F" + (dir ? " /t" : "") + " /c /q" }
+        };
+        foreach (var c in cmds)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(c[0], c[1]) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using (var p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
+                    p.WaitForExit(120000);
+                }
+            }
+            catch { }
+        }
+    }
+    static bool RelaunchAsAdmin(string folder)
+    {
+        try
+        {
+            string exe = Process.GetCurrentProcess().MainModule.FileName;
+            string arg = folder.TrimEnd('\\');
+            if (arg.Length == 2) arg += "\\.";   // drive root: "C:" -> "C:\." (a trailing \ would escape the quote)
+            Process.Start(new ProcessStartInfo(exe, "\"" + arg + "\"") { Verb = "runas", UseShellExecute = true });
             return true;
         }
-        catch { return false; }
+        catch { return false; }   // UAC prompt declined
     }
 
     // -------------------------------------------------- file-in-use unlock --
@@ -707,26 +897,40 @@ static class Strata
         return outp;
     }
 
-    // Deletes `target`. If it's locked by a running app, finds that app,
-    // closes it, and retries once. `closedApp` is set (non-null) only when
-    // an app actually had to be closed to make the delete succeed.
-    static bool TryDeleteWithUnlock(string target, out string closedApp)
+    // Deletes `target` (Recycle Bin when it can take it, permanent otherwise or
+    // when `permanent`). On failure it escalates: take ownership if we're
+    // Administrator, then find the app holding it open, close it and retry.
+    // Returns null on success, else why it failed. `closedApp` is set only when
+    // an app had to be closed.
+    static string DeleteOne(string target, bool permanent, long size, out string closedApp)
     {
         closedApp = null;
-        if (RecycleOne(target)) return true;
-        if (!File.Exists(target) && !Directory.Exists(target)) return true; // already gone
+        if (!PathExists(target)) return null;                       // already gone
+        bool useBin = !permanent && NoBinReason(target, size) == null;
+        string err = useBin ? RecycleOne(target) : ForceDelete(target);
+        if (err == null) return null;
+
+        if (err.IndexOf("access denied") >= 0 && IsAdmin())
+        {
+            TakeOwnership(target);
+            err = useBin ? RecycleOne(target) : ForceDelete(target);
+            if (err == null) return null;
+        }
 
         List<string> probe = Directory.Exists(target) ? CollectFilesCapped(target, 2000) : new List<string> { target };
         if (probe.Count == 0) probe = new List<string> { target };
-
         var locking = FindLockingProcesses(probe);
-        if (locking.Count == 0) return false;
-
-        var names = new List<string>();
-        foreach (var p in locking) { try { names.Add(p.ProcessName); p.Kill(); p.WaitForExit(3000); } catch { } }
-        closedApp = string.Join(", ", names.ToArray());
-        Thread.Sleep(300);
-        return RecycleOne(target);
+        if (locking.Count > 0)
+        {
+            var names = new List<string>();
+            foreach (var p in locking) { try { names.Add(p.ProcessName); p.Kill(); p.WaitForExit(3000); } catch { } }
+            closedApp = string.Join(", ", names.ToArray());
+            Thread.Sleep(300);
+            err = useBin ? RecycleOne(target) : ForceDelete(target);
+            if (err == null) return null;
+        }
+        if (err.IndexOf("access denied") >= 0 && !IsAdmin()) err += " — needs Administrator";
+        return err;
     }
 
     // Deletes a list of items on a background thread while the main thread
@@ -736,25 +940,35 @@ static class Strata
     static int _delDone, _delOk, _delUnlocked, _delBlocked, _delFailed;
     static string _delClosed;
     static readonly List<string> LastDeleted = new List<string>();  // for Undo
+    static readonly List<KeyValuePair<string, long>> _failItems = new List<KeyValuePair<string, long>>();  // what failed...
+    static readonly List<string> _failWhy = new List<string>();                                          // ...and why
+    static bool QuitNow;   // set when Citrus restarts itself as Administrator
 
-    static void DeleteWithProgress(List<string> targets, out int ok, out int unlocked, out int blocked, out int failed, out string lastClosed)
+    static void DeleteWithProgress(List<KeyValuePair<string, long>> targets, bool permanent, out int ok, out int unlocked, out int blocked, out int failed, out string lastClosed)
     {
         CancelScan = false;
         _delDone = _delOk = _delUnlocked = _delBlocked = _delFailed = 0; _delClosed = "";
-        lock (LastDeleted) LastDeleted.Clear();
+        if (!permanent) lock (LastDeleted) LastDeleted.Clear();
+        _failItems.Clear(); _failWhy.Clear();
 
         // Recycle Bin operations go through the shell (SHFileOperation), which
         // needs an STA thread with COM — a thread-pool thread can silently fail.
         var worker = new Thread(() =>
         {
-            foreach (var t in targets)
+            foreach (var kv in targets)
             {
+                string t = kv.Key;
                 if (CancelScan) break;
                 if (IsProtected(t)) { _delBlocked++; _delDone++; continue; }
                 string closedApp;
-                bool success = TryDeleteWithUnlock(t, out closedApp);
-                if (success) { _delOk++; if (closedApp != null) { _delUnlocked++; _delClosed = closedApp; } ForgetCache(t); lock (LastDeleted) LastDeleted.Add(t); }
-                else _delFailed++;
+                string why = DeleteOne(t, permanent, kv.Value, out closedApp);
+                if (why == null)
+                {
+                    _delOk++; if (closedApp != null) { _delUnlocked++; _delClosed = closedApp; }
+                    ForgetCache(t);
+                    if (!permanent) lock (LastDeleted) LastDeleted.Add(t);
+                }
+                else { _delFailed++; _failItems.Add(kv); _failWhy.Add(why); }
                 _delDone++;
             }
         });
@@ -797,42 +1011,275 @@ static class Strata
         catch { }
     }
 
+    // Counts what's inside `root` without keeping any file list: c = files, folders,
+    // bytes, links. `sample` collects up to 1000 file paths to ask Windows who has open.
+    static void CountTree(string root, long size, long[] c, List<string> sample)
+    {
+        string r = root.Length > 3 ? root.TrimEnd('\\') : root;
+        uint a = GetFileAttributes(LongPath(r));
+        if (a == 0xFFFFFFFF) return;
+        if ((a & FA_REPARSE) != 0) { c[3]++; return; }
+        if ((a & FA_DIR) == 0) { c[0]++; c[2] += size; if (sample.Count < 1000) sample.Add(r); return; }
+        c[1]++;
+        var stack = new Stack<string>();
+        stack.Push(r);
+        while (stack.Count > 0)
+        {
+            if (CancelScan) return;
+            string dir = stack.Pop();
+            WIN32_FIND_DATA fd;
+            IntPtr h = FindFirstFileEx(SearchGlob(dir), 1, out fd, 0, IntPtr.Zero, 2);
+            if (h == INVALID) continue;
+            try
+            {
+                do
+                {
+                    string n = fd.cFileName;
+                    if (n == "." || n == "..") continue;
+                    if ((fd.dwFileAttributes & FA_REPARSE) != 0) { c[3]++; continue; }
+                    if ((fd.dwFileAttributes & FA_DIR) != 0) { c[1]++; stack.Push(dir.TrimEnd('\\') + "\\" + n); }
+                    else
+                    {
+                        c[0]++; c[2] += ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+                        if (sample.Count < 1000) sample.Add(dir.TrimEnd('\\') + "\\" + n);
+                    }
+                } while (FindNextFile(h, out fd));
+            }
+            finally { FindClose(h); }
+        }
+    }
+
+    static bool UnderPath(string p, string root)
+    {
+        if (string.IsNullOrEmpty(root)) return false;
+        string r = root.TrimEnd('\\');
+        return p.Equals(r, StringComparison.OrdinalIgnoreCase) || p.StartsWith(r + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Full-screen "what will be affected" check shown before any delete.
+    // Returns 0 = cancel, 1 = delete (Recycle Bin where possible), 2 = delete permanently.
+    // `targets` gets its sizes refreshed to the counted ones.
+    static int DeletePreview(List<KeyValuePair<string, long>> targets)
+    {
+        int n = targets.Count;
+        var cnt = new long[n][];
+        for (int i = 0; i < n; i++) cnt[i] = new long[4];
+        var sample = new List<string>();
+        List<Process> holders = new List<Process>();
+        CancelScan = false;
+        Console.ResetColor(); Console.Clear();
+        Console.BackgroundColor = ConsoleColor.DarkRed; Console.ForegroundColor = ConsoleColor.White;
+        Line(" CITRUS — checking what this delete would touch…"); Console.ResetColor();
+        var task = Task.Factory.StartNew(() =>
+        {
+            for (int i = 0; i < n && !CancelScan; i++) CountTree(targets[i].Key, targets[i].Value, cnt[i], sample);
+            if (!CancelScan && sample.Count > 0) holders = FindLockingProcesses(sample);
+        });
+        while (!task.IsCompleted)
+        {
+            long f = 0, b = 0; for (int i = 0; i < n; i++) { f += cnt[i][0]; b += cnt[i][2]; }
+            ProgressLine("Counting… " + f + " files, " + Human(b));
+            if (EscPressedDuringScan()) CancelScan = true;
+            Thread.Sleep(60);
+        }
+        try { task.Wait(); } catch { }
+        if (CancelScan) return 0;
+
+        long files = 0, folders = 0, bytes = 0, links = 0;
+        for (int i = 0; i < n; i++)
+        {
+            files += cnt[i][0]; folders += cnt[i][1]; bytes += cnt[i][2]; links += cnt[i][3];
+            targets[i] = new KeyValuePair<string, long>(targets[i].Key, cnt[i][2]);
+        }
+
+        // warnings + where it goes
+        var warn = new List<string>();
+        string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        string pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+        string prof = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        bool hitWin = false, hitPf = false, hitDrive = false, hitProf = false; int noBin = 0; string noBinWhy = null;
+        for (int i = 0; i < n; i++)
+        {
+            string t = targets[i].Key;
+            if (UnderPath(t, win)) hitWin = true;
+            if (UnderPath(t, pf) || UnderPath(t, pf86)) hitPf = true;
+            if (IsDriveRoot(t)) hitDrive = true;
+            if (prof.Length > 0 && t.TrimEnd('\\').Equals(prof.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) hitProf = true;
+            string why = NoBinReason(t, targets[i].Value);
+            if (why != null) { noBin++; if (noBinWhy == null) noBinWhy = why; }
+        }
+        if (hitDrive) warn.Add("This is a whole drive.");
+        if (hitProf) warn.Add("This is your whole user profile (documents, desktop, settings…).");
+        if (hitWin) warn.Add("Part of Windows itself — deleting it can stop Windows working or booting.");
+        if (hitPf) warn.Add("Installed programs — they may stop working.");
+        if (links > 0) warn.Add(links + " link/junction(s) inside — only the link is removed, never what it points to.");
+        var names = new List<string>();
+        foreach (var p in holders) { try { names.Add(p.ProcessName); } catch { } }
+        if (names.Count > 0) warn.Add("Open in: " + string.Join(", ", names.ToArray()) + " — Citrus will close it first.");
+
+        int cols = Cols, rows = Rows;
+        Console.ResetColor(); Console.Clear();
+        Console.BackgroundColor = ConsoleColor.DarkRed; Console.ForegroundColor = ConsoleColor.White;
+        Line(" CITRUS — delete preview"); Console.ResetColor();
+        Console.WriteLine();
+        W(" You are about to delete " + (n == 1 ? "this item" : n + " items") + ":\n\n", ConsoleColor.White);
+        int maxList = Math.Max(2, rows - 14 - warn.Count);
+        for (int i = 0; i < n && i < maxList; i++)
+        {
+            string nm = Path.GetFileName(targets[i].Key.TrimEnd('\\')); if (nm.Length == 0) nm = targets[i].Key;
+            bool isDir = cnt[i][1] > 0;
+            string detail = isDir ? (cnt[i][0] + " files · " + (cnt[i][1] - 1) + " folders") : (cnt[i][3] > 0 ? "link (its target is untouched)" : "file");
+            string size = Human(targets[i].Value).PadLeft(10);
+            int nameW = Math.Max(10, cols - 2 - 4 - 10 - 2 - 28);
+            W("   " + (isDir ? "▸ " : "  "), ConsoleColor.Yellow);
+            W(Fit(nm, nameW) + "  ", ConsoleColor.White);
+            W(Fit(detail, 26) + " ", ConsoleColor.DarkGray);
+            W(size + "\n", ConsoleColor.Cyan);
+        }
+        if (n > maxList) W("   … and " + (n - maxList) + " more\n", ConsoleColor.DarkGray);
+        Console.WriteLine();
+        W(" Total: " + files + " files · " + Math.Max(0, folders) + " folders · " + Human(bytes) + "\n\n", ConsoleColor.Green);
+        if (noBin == 0)
+            W(" Goes to the Recycle Bin — you can restore it.\n", ConsoleColor.Green);
+        else
+            W(" " + noBin + " of " + n + " can't use the Recycle Bin (" + noBinWhy + ") — those are deleted PERMANENTLY, no way back.\n", ConsoleColor.Red);
+        foreach (var w in warn) W(" ⚠ " + Fit(w, cols - 6) + "\n", ConsoleColor.Yellow);
+        Console.ResetColor();
+
+        // bottom bar: Enter = delete · P = permanently · Esc = cancel
+        int y = rows - 1;
+        Console.SetCursorPosition(0, y);
+        string yes = " Enter = DELETE ", perm = " P = delete permanently ", can = " Esc = cancel ";
+        int yesX = 1, permX = yesX + yes.Length + 1, canX = permX + perm.Length + 1;
+        Console.Write(" ");
+        Console.BackgroundColor = ConsoleColor.DarkGreen; Console.ForegroundColor = ConsoleColor.White; Console.Write(yes); Console.ResetColor(); Console.Write(" ");
+        Console.BackgroundColor = ConsoleColor.DarkRed; Console.ForegroundColor = ConsoleColor.White; Console.Write(perm); Console.ResetColor(); Console.Write(" ");
+        Console.BackgroundColor = ConsoleColor.Gray; Console.ForegroundColor = ConsoleColor.Black; Console.Write(can); Console.ResetColor();
+        while (true)
+        {
+            var ev = ReadEvent();
+            if (ev.Kind == Ev.Key)
+            {
+                if (ev.VK == 0x0D) return 1;
+                if (ev.Ch == 'p' || ev.Ch == 'P') return 2;
+                if (ev.VK == 0x1B || ev.Ch == 'n' || ev.Ch == 'N') return 0;
+            }
+            else if (ev.Kind == Ev.Click && ev.Y == y)
+            {
+                if (ev.X >= yesX && ev.X < yesX + yes.Length) return 1;
+                if (ev.X >= permX && ev.X < permX + perm.Length) return 2;
+                if (ev.X >= canX && ev.X < canX + can.Length) return 0;
+            }
+            else if (ev.Kind == Ev.Resize) return 0;
+        }
+    }
+
+    // Shows what couldn't be deleted and why, and offers the next step for each
+    // case: P = permanently (skip the Recycle Bin), R = at next restart,
+    // A = restart Citrus as Administrator. Returns how many it managed to remove.
+    static int FailedScreen(List<KeyValuePair<string, long>> items, List<string> whys, out string note)
+    {
+        note = "";
+        int removed = 0;
+        while (items.Count > 0)
+        {
+            int cols = Cols, rows = Rows;
+            bool admin = IsAdmin();
+            Console.ResetColor(); Console.Clear();
+            Console.BackgroundColor = ConsoleColor.DarkRed; Console.ForegroundColor = ConsoleColor.White;
+            Line(" CITRUS — " + items.Count + " item(s) couldn't be deleted"); Console.ResetColor();
+            Console.WriteLine();
+            int max = Math.Max(2, rows - 9);
+            for (int i = 0; i < items.Count && i < max; i++)
+            {
+                W("   " + Fit(whys[i], 34) + " ", ConsoleColor.Red);
+                string p = items[i].Key;
+                int w = Math.Max(10, cols - 40);
+                W((p.Length > w ? "…" + p.Substring(p.Length - w + 1) : p) + "\n", ConsoleColor.White);
+            }
+            if (items.Count > max) W("   … and " + (items.Count - max) + " more\n", ConsoleColor.DarkGray);
+            Console.WriteLine();
+            W("   P  delete permanently (skips the Recycle Bin — no way back)\n", ConsoleColor.Yellow);
+            W("   R  remove at next restart (for files Windows keeps locked)" + (admin ? "" : " — needs Administrator") + "\n", ConsoleColor.Yellow);
+            if (!admin) W("   A  restart Citrus as Administrator (then try again)\n", ConsoleColor.Yellow);
+            W("   Esc  leave them\n", ConsoleColor.DarkGray);
+            Console.ResetColor();
+
+            var ev = ReadEvent();
+            if (ev.Kind != Ev.Key) continue;
+            if (ev.VK == 0x1B) break;
+            if (ev.Ch == 'a' || ev.Ch == 'A')
+            {
+                if (admin) continue;
+                if (RelaunchAsAdmin(CurrentPath)) { QuitNow = true; note = "restarting as Administrator"; break; }
+                note = "Administrator restart was cancelled";
+            }
+            else if (ev.Ch == 'r' || ev.Ch == 'R')
+            {
+                int sched = 0; var left = new List<KeyValuePair<string, long>>(); var leftWhy = new List<string>();
+                for (int i = 0; i < items.Count; i++)
+                {
+                    string e = ScheduleAtRestart(items[i].Key);
+                    if (e == null) sched++; else { left.Add(items[i]); leftWhy.Add(e + (e.IndexOf("access denied") >= 0 && !admin ? " — needs Administrator" : "")); }
+                }
+                if (sched > 0) note = sched + " will be removed at next restart";
+                items = left; whys = leftWhy;
+            }
+            else if (ev.Ch == 'p' || ev.Ch == 'P')
+            {
+                if (!ConfirmBar("⚠  PERMANENTLY delete " + items.Count + " item(s)? Skips the Recycle Bin — cannot be undone.", "Enter = YES")) continue;
+                int ok, unl, blk, fail; string lc;
+                DeleteWithProgress(items, true, out ok, out unl, out blk, out fail, out lc);
+                removed += ok;
+                items = new List<KeyValuePair<string, long>>(_failItems); whys = new List<string>(_failWhy);
+            }
+        }
+        Console.ResetColor(); Console.Clear();
+        return removed;
+    }
+
     static void DeleteSelected()
     {
         if (View.Count == 0) return;
 
-        var targets = new List<string>();
-        string label;
+        var targets = new List<KeyValuePair<string, long>>();
         var marked = new List<Entry>();
         foreach (var e in View) if (e.Mark) marked.Add(e);
         if (marked.Count > 0)
         {
-            long tot = 0; foreach (var e in marked) { targets.Add(Path.Combine(CurrentPath, e.Name)); tot += e.Size; }
-            label = marked.Count + " ticked items (" + Human(tot) + ")";
+            foreach (var e in marked) targets.Add(new KeyValuePair<string, long>(Path.Combine(CurrentPath, e.Name), e.Size));
         }
         else
         {
             var one = View[Sel];
             string t = Path.Combine(CurrentPath, one.Name);
             if (IsProtected(t)) { BlockBar("⚠  '" + one.Name + "' is a system item — Citrus won't delete it.  (Esc)"); return; }
-            targets.Add(t);
-            label = "'" + one.Name + "' (" + Human(one.Size) + ")";
+            targets.Add(new KeyValuePair<string, long>(t, one.Size));
         }
 
-        if (!ConfirmBar("⚠  Delete " + label + "?  Moves to the Recycle Bin.", "Enter = YES")) return;
+        int mode = DeletePreview(targets);
+        if (mode == 0) { Console.ResetColor(); Console.Clear(); return; }
 
         int ok, unlocked, blocked, failed; string lastClosed;
-        DeleteWithProgress(targets, out ok, out unlocked, out blocked, out failed, out lastClosed);
+        DeleteWithProgress(targets, mode == 2, out ok, out unlocked, out blocked, out failed, out lastClosed);
+        string note = "";
+        if (failed > 0)
+        {
+            int rec = FailedScreen(new List<KeyValuePair<string, long>>(_failItems), new List<string>(_failWhy), out note);
+            ok += rec; failed -= rec;
+        }
         ForgetCache(CurrentPath);
         ScanScreen(false);
 
         // Always leave a visible result on the redrawn screen (green = ok).
+        string extra = note.Length > 0 ? " · " + note : "";
         if (failed > 0 || blocked > 0)
-            Status = "! " + ok + " deleted · " + failed + " couldn't be removed (in use or denied) · " + blocked + " protected";
+            Status = "! " + ok + " deleted · " + failed + " couldn't be removed · " + blocked + " protected" + extra;
         else if (unlocked > 0)
-            Status = "✓ Deleted " + ok + " — closed " + lastClosed + " to free the file";
+            Status = "✓ Deleted " + ok + " — closed " + lastClosed + " to free the file" + extra;
         else
-            Status = "✓ Deleted " + ok + " item" + (ok == 1 ? "" : "s");
+            Status = "✓ Deleted " + ok + " item" + (ok == 1 ? "" : "s") + extra;
     }
 
     // type-to-filter, live
@@ -1002,6 +1449,13 @@ static class Strata
 
     static void CollectFiles(string root, long minSize, List<KeyValuePair<string, long>> outFiles, int[] dirsDone, int limit = 0)
     {
+        WalkFiles(root, minSize, dirsDone, (p, sz, mt) => KeepLargest(outFiles, p, sz, limit));
+    }
+
+    // Streams every file >= minSize under root to onFile(path, size, lastWrite) and
+    // keeps none of them — the caller decides what (little) to retain.
+    static void WalkFiles(string root, long minSize, int[] dirsDone, Action<string, long, long> onFile)
+    {
         var stack = new Stack<string>();
         stack.Push(root);
         while (stack.Count > 0)
@@ -1024,7 +1478,7 @@ static class Strata
                     else
                     {
                         long sz = ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                        if (sz >= minSize) KeepLargest(outFiles, full, sz, limit);
+                        if (sz >= minSize) onFile(full, sz, FtToLong(fd.ftLastWriteTime));
                     }
                 } while (FindNextFile(h, out fd));
             }
@@ -1039,6 +1493,7 @@ static class Strata
         int sel = 0, off = 0;
         while (true)
         {
+            if (QuitNow) return;
             int cols = Cols, rows2 = Rows, listRows = rows2 - 4;
             Console.ResetColor(); Console.SetCursorPosition(0, 0);
             Console.BackgroundColor = ConsoleColor.DarkBlue; Console.ForegroundColor = ConsoleColor.White;
@@ -1094,12 +1549,18 @@ static class Strata
                     {
                         string t = rows[sel].Key;
                         if (IsProtected(t)) { BlockBar("⚠  '" + Path.GetFileName(t) + "' is a system item — won't delete.  (Esc)"); break; }
-                        if (ConfirmBar("Delete '" + Path.GetFileName(t) + "' (" + Human(rows[sel].Value) + ")? → Recycle Bin", "Enter = YES"))
+                        var one = new List<KeyValuePair<string, long>> { rows[sel] };
+                        int mode = DeletePreview(one);
+                        if (mode != 0)
                         {
-                            string closedApp;
-                            if (TryDeleteWithUnlock(t, out closedApp)) { rows.RemoveAt(sel); if (sel >= rows.Count) sel = Math.Max(0, rows.Count - 1); if (closedApp != null) BlockBar("Deleted — closed " + closedApp + " which had it open.  (Esc)"); }
-                            else BlockBar("Delete failed — the file is locked and its app couldn't be closed.  (Esc)");
+                            int ok, unl, blk, fail; string lc, note = "";
+                            DeleteWithProgress(one, mode == 2, out ok, out unl, out blk, out fail, out lc);
+                            if (fail > 0 && FailedScreen(new List<KeyValuePair<string, long>>(_failItems), new List<string>(_failWhy), out note) > 0) ok = 1;
+                            if (ok > 0) { rows.RemoveAt(sel); if (sel >= rows.Count) sel = Math.Max(0, rows.Count - 1); }
+                            Console.ResetColor(); Console.Clear();
+                            if (ok > 0 && unl > 0) BlockBar("Deleted — closed " + lc + " which had it open.  (Esc)");
                         }
+                        else { Console.ResetColor(); Console.Clear(); }
                     }
                     break;
                 default:
@@ -1136,53 +1597,122 @@ static class Strata
         Console.ResetColor(); Console.Clear();
         Console.BackgroundColor = ConsoleColor.DarkBlue; Console.ForegroundColor = ConsoleColor.White; Line(" CITRUS — duplicate files under " + CurrentPath); Console.ResetColor();
         CancelScan = false;
-        var files = new List<KeyValuePair<string, long>>();
+        const long MinDup = 1024L * 1024;   // >= 1 MB
         int[] dirs = { 0 };
-        var t = Task.Factory.StartNew(() => CollectFiles(CurrentPath, 1024L * 1024, files, dirs)); // >= 1 MB
-        while (!t.IsCompleted) { ProgressLine("Finding candidates… " + dirs[0] + " folders, " + files.Count + " files"); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(60); }
+
+        // Pass 1 — remember only which sizes occur more than once (no paths held).
+        var sizeSeen = new Dictionary<long, bool>();
+        var t = Task.Factory.StartNew(() => WalkFiles(CurrentPath, MinDup, dirs, (p, sz, mt) => { bool again; sizeSeen[sz] = sizeSeen.TryGetValue(sz, out again); }));
+        while (!t.IsCompleted) { ProgressLine("Finding candidates… " + dirs[0] + " folders"); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(60); }
         try { t.Wait(); } catch { }
 
-        // group by size, then hash only the size-collision groups
-        var bySize = new Dictionary<long, List<string>>();
-        foreach (var kv in files) { List<string> l; if (!bySize.TryGetValue(kv.Value, out l)) { l = new List<string>(); bySize[kv.Value] = l; } l.Add(kv.Key); }
-        var candidates = new List<KeyValuePair<long, List<string>>>();
-        foreach (var g in bySize) if (g.Value.Count > 1) candidates.Add(g);
-
-        var dupRows = new List<KeyValuePair<string, long>>();
-        long wasted = 0;
-        int hashed = 0, totalToHash = 0; foreach (var g in candidates) totalToHash += g.Value.Count;
-        foreach (var g in candidates)
+        // Pass 2 — keep paths only for files whose size collided.
+        var groups = new Dictionary<long, List<string>>();
+        dirs[0] = 0;
+        if (!CancelScan)
         {
-            if (CancelScan) break;
-            var byHash = new Dictionary<string, List<string>>();
-            foreach (var path in g.Value)
+            t = Task.Factory.StartNew(() => WalkFiles(CurrentPath, MinDup, dirs, (p, sz, mt) =>
+            {
+                bool dup; if (!sizeSeen.TryGetValue(sz, out dup) || !dup) return;
+                List<string> l; if (!groups.TryGetValue(sz, out l)) { l = new List<string>(); groups[sz] = l; }
+                l.Add(p);
+            }));
+            while (!t.IsCompleted) { ProgressLine("Collecting same-size files… " + dirs[0] + " folders"); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(60); }
+            try { t.Wait(); } catch { }
+        }
+        sizeSeen = null;
+
+        // Compare on a worker so Esc works mid-file: a cheap fingerprint first
+        // (start / middle / end of the file), a full hash only for fingerprint matches.
+        var dupRows = new List<KeyValuePair<string, long>>();   // only the 500 biggest duplicates are kept
+        long wasted = 0; int dupCount = 0;
+        int[] prog = { 0, 0 };
+        foreach (var g in groups) prog[1] += g.Value.Count;
+        var cmp = Task.Factory.StartNew(() =>
+        {
+            foreach (var g in groups)
             {
                 if (CancelScan) break;
-                hashed++;
-                if ((hashed & 7) == 0) { ProgressLine("Comparing files… " + hashed + "/" + totalToHash); if (EscPressedDuringScan()) CancelScan = true; }
-                string hh = HashFile(path);
-                if (hh == null) continue;
-                List<string> l; if (!byHash.TryGetValue(hh, out l)) { l = new List<string>(); byHash[hh] = l; } l.Add(path);
-            }
-            foreach (var hg in byHash)
-                if (hg.Value.Count > 1)
+                foreach (var quick in SplitByHash(g.Value, g.Key, false, prog))
                 {
-                    // keep first as original; list the rest as reclaimable duplicates
-                    for (int i = 1; i < hg.Value.Count; i++) { dupRows.Add(new KeyValuePair<string, long>(hg.Value[i], g.Key)); wasted += g.Key; }
+                    prog[1] += quick.Count;
+                    foreach (var same in SplitByHash(quick, g.Key, true, prog))
+                        for (int i = 1; i < same.Count; i++)   // first is the original; the rest are reclaimable
+                        { KeepLargest(dupRows, same[i], g.Key, 500); wasted += g.Key; dupCount++; }
                 }
-        }
+            }
+        });
+        while (!cmp.IsCompleted) { ProgressLine("Comparing files… " + prog[0] + "/" + prog[1]); if (EscPressedDuringScan()) CancelScan = true; Thread.Sleep(80); }
+        try { cmp.Wait(); } catch { }
+        groups = null;
+
         dupRows.Sort((a, b) => b.Value.CompareTo(a.Value));
-        ListScreen("CITRUS — duplicate files (" + Human(wasted) + " reclaimable, ≥ 1 MB)", dupRows,
+        ListScreen("CITRUS — duplicate files (" + Human(wasted) + " reclaimable" + (dupCount > dupRows.Count ? ", biggest " + dupRows.Count + " of " + dupCount : "") + ", ≥ 1 MB)", dupRows,
                    "No duplicate files ≥ 1 MB found here.");
     }
 
+    // Splits same-size files into groups with identical fingerprints (quick or full);
+    // returns only the groups with 2+ members.
+    static List<List<string>> SplitByHash(List<string> paths, long size, bool full, int[] prog)
+    {
+        var by = new Dictionary<string, List<string>>();
+        foreach (var p in paths)
+        {
+            if (CancelScan) break;
+            string h = full ? HashFile(p) : QuickHash(p, size);
+            prog[0]++;
+            if (h == null) continue;
+            List<string> l; if (!by.TryGetValue(h, out l)) { l = new List<string>(); by[h] = l; }
+            l.Add(p);
+        }
+        var res = new List<List<string>>();
+        foreach (var kv in by) if (kv.Value.Count > 1) res.Add(kv.Value);
+        return res;
+    }
+
+    // MD5 of 64 KB from the start, middle and end — enough to tell almost all
+    // different files of the same size apart without reading them whole.
+    static string QuickHash(string path, long size)
+    {
+        try
+        {
+            using (var md5 = MD5.Create())
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))
+            {
+                var buf = new byte[1 << 16];
+                long[] at = { 0, Math.Max(0, size / 2 - buf.Length / 2), Math.Max(0, size - buf.Length) };
+                foreach (long pos in at)
+                {
+                    fs.Seek(pos, SeekOrigin.Begin);
+                    int got = 0, r;
+                    while (got < buf.Length && (r = fs.Read(buf, got, buf.Length - got)) > 0) got += r;
+                    md5.TransformBlock(buf, 0, got, null, 0);
+                }
+                md5.TransformFinalBlock(buf, 0, 0);
+                return BitConverter.ToString(md5.Hash);
+            }
+        }
+        catch { return null; }
+    }
+
+    // Whole-file MD5 in 1 MB chunks; stops early (returns null) if cancelled.
     static string HashFile(string path)
     {
         try
         {
             using (var md5 = MD5.Create())
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16))
-                return BitConverter.ToString(md5.ComputeHash(fs));
+            {
+                var buf = new byte[1 << 20];
+                int got;
+                while ((got = fs.Read(buf, 0, buf.Length)) > 0)
+                {
+                    if (CancelScan) return null;
+                    md5.TransformBlock(buf, 0, got, null, 0);
+                }
+                md5.TransformFinalBlock(buf, 0, 0);
+                return BitConverter.ToString(md5.Hash);
+            }
         }
         catch { return null; }
     }
@@ -1200,7 +1730,7 @@ static class Strata
             new[] { "Enter / →", "open folder, or open file in its app" },
             new[] { "← / Backspace", "go up a folder" },
             new[] { "Space", "tick / untick a row (multi-select)" },
-            new[] { "Delete", "delete selected - or all ticked - to Recycle Bin" },
+            new[] { "Delete", "delete selected - or all ticked (preview first)" },
             new[] { "O", "open selected in File Explorer" },
             new[] { "/", "filter this folder by name" },
             new[] { "S", "cycle sort: size / name / newest" },
@@ -1493,15 +2023,14 @@ static class Strata
                     {
                         long sz = ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
                         long mt = FtToLong(fd.ftLastWriteTime);
-                        if (sz >= 1024L * 1024 && mt > 0 && mt < cutoff) files.Add(new KeyValuePair<string, long>(d + "\\" + n, sz));
+                        if (sz >= 1024L * 1024 && mt > 0 && mt < cutoff) KeepLargest(files, d + "\\" + n, sz, 500);   // only the 500 biggest are ever held
                     }
                 } while (FindNextFile(hnd, out fd));
             }
             finally { FindClose(hnd); }
-            if (dirs % 40 == 0) { ProgressLine("Scanning… " + dirs + " folders, " + files.Count + " found"); if (EscPressedDuringScan()) CancelScan = true; }
+            if (dirs % 40 == 0) { ProgressLine("Scanning… " + dirs + " folders, biggest " + files.Count + " kept"); if (EscPressedDuringScan()) CancelScan = true; }
         }
         files.Sort((a, b) => b.Value.CompareTo(a.Value));
-        if (files.Count > 500) files = files.GetRange(0, 500);
         ListScreen("CITRUS — big old files (≥ 1 MB, 1+ year old)", files, "No big old files here.");
     }
 
@@ -2566,6 +3095,7 @@ static class Strata
 
             while (true)
             {
+                if (QuitNow) return 0;   // restarted as Administrator
                 Draw();
                 var ev = ReadEvent();
                 if (ev.Kind == Ev.Resize) { Console.Clear(); continue; }
@@ -3152,7 +3682,8 @@ class App:
 
     # ----- collect / biggest / dupes -----
 
-    def collect(self, min_size, progress, limit=0):
+    def collect(self, min_size, progress, limit=0, on_file=None):
+        # on_file(path, size): stream each match to a callback and keep nothing.
         files = []
         dirs = 0
         found = 0
@@ -3174,7 +3705,9 @@ class App:
                                 sz = e.stat(follow_symlinks=False).st_size
                                 if sz >= min_size:
                                     found += 1
-                                    if limit <= 0:
+                                    if on_file is not None:
+                                        on_file(e.path, sz)
+                                    elif limit <= 0:
                                         files.append((e.path, sz))
                                     else:
                                         # Keep earlier matches on ties, as the stable sort did.
@@ -3272,37 +3805,61 @@ class App:
             sys.stdout.flush()
             if esc_pressed():
                 self.cancel.set()
-        files = self.collect(1024 * 1024, prog)
+        # Pass 1 remembers only which sizes occur twice; pass 2 keeps paths just for those.
+        seen = {}
+        def first(path, sz):
+            seen[sz] = sz in seen
+        self.collect(1024 * 1024, prog, on_file=first)
         by_size = {}
-        for path, sz in files:
-            by_size.setdefault(sz, []).append(path)
+        def second(path, sz):
+            if seen.get(sz):
+                by_size.setdefault(sz, []).append(path)
+        if not self.cancel.is_set():
+            self.collect(1024 * 1024, prog, on_file=second)
+        seen = None
         dup_rows = []
         wasted = 0
-        cand = [(sz, ps) for sz, ps in by_size.items() if len(ps) > 1]
+        cand = [(sz, ps) for sz, ps in by_size.items()]
         total = sum(len(ps) for _, ps in cand)
         done = 0
         for sz, paths in cand:
             if self.cancel.is_set():
                 break
-            by_hash = {}
-            for p in paths:
-                done += 1
-                if done % 8 == 0:
-                    sys.stdout.write("\r" + c("30;103", " Comparing... %d/%d " % (done, total)) + "\x1b[K")
-                    sys.stdout.flush()
-                    if esc_pressed():
-                        self.cancel.set()
-                        break
-                h = self.hash_file(p)
-                if h:
-                    by_hash.setdefault(h, []).append(p)
-            for group in by_hash.values():
-                if len(group) > 1:
-                    for extra in group[1:]:
+            # cheap fingerprint first (start/middle/end), full hash only for matches
+            for group in self.split_by_hash(paths, sz, False):
+                for same in self.split_by_hash(group, sz, True):
+                    for extra in same[1:]:
                         dup_rows.append((extra, sz))
                         wasted += sz
+            done += len(paths)
+            sys.stdout.write("\r" + c("30;103", " Comparing... %d/%d " % (done, total)) + "\x1b[K")
+            sys.stdout.flush()
+            if esc_pressed():
+                self.cancel.set()
         dup_rows.sort(key=lambda kv: kv[1], reverse=True)
-        self.list_screen("CITRUS - duplicates (" + human(wasted) + " reclaimable, >= 1 MB)", dup_rows)
+        self.list_screen("CITRUS - duplicates (" + human(wasted) + " reclaimable, >= 1 MB)", dup_rows[:500])
+
+    def split_by_hash(self, paths, size, full):
+        by = {}
+        for p in paths:
+            if self.cancel.is_set():
+                break
+            h = self.hash_file(p) if full else self.quick_hash(p, size)
+            if h:
+                by.setdefault(h, []).append(p)
+        return [g for g in by.values() if len(g) > 1]
+
+    @staticmethod
+    def quick_hash(path, size):
+        try:
+            h = hashlib.md5()
+            with open(path, "rb") as f:
+                for pos in (0, max(0, size // 2 - 32768), max(0, size - 65536)):
+                    f.seek(pos)
+                    h.update(f.read(65536))
+            return h.hexdigest()
+        except OSError:
+            return None
 
     @staticmethod
     def hash_file(path):

@@ -503,7 +503,8 @@ class App:
 
     # ----- collect / biggest / dupes -----
 
-    def collect(self, min_size, progress, limit=0):
+    def collect(self, min_size, progress, limit=0, on_file=None):
+        # on_file(path, size): stream each match to a callback and keep nothing.
         files = []
         dirs = 0
         found = 0
@@ -525,7 +526,9 @@ class App:
                                 sz = e.stat(follow_symlinks=False).st_size
                                 if sz >= min_size:
                                     found += 1
-                                    if limit <= 0:
+                                    if on_file is not None:
+                                        on_file(e.path, sz)
+                                    elif limit <= 0:
                                         files.append((e.path, sz))
                                     else:
                                         # Keep earlier matches on ties, as the stable sort did.
@@ -623,37 +626,61 @@ class App:
             sys.stdout.flush()
             if esc_pressed():
                 self.cancel.set()
-        files = self.collect(1024 * 1024, prog)
+        # Pass 1 remembers only which sizes occur twice; pass 2 keeps paths just for those.
+        seen = {}
+        def first(path, sz):
+            seen[sz] = sz in seen
+        self.collect(1024 * 1024, prog, on_file=first)
         by_size = {}
-        for path, sz in files:
-            by_size.setdefault(sz, []).append(path)
+        def second(path, sz):
+            if seen.get(sz):
+                by_size.setdefault(sz, []).append(path)
+        if not self.cancel.is_set():
+            self.collect(1024 * 1024, prog, on_file=second)
+        seen = None
         dup_rows = []
         wasted = 0
-        cand = [(sz, ps) for sz, ps in by_size.items() if len(ps) > 1]
+        cand = [(sz, ps) for sz, ps in by_size.items()]
         total = sum(len(ps) for _, ps in cand)
         done = 0
         for sz, paths in cand:
             if self.cancel.is_set():
                 break
-            by_hash = {}
-            for p in paths:
-                done += 1
-                if done % 8 == 0:
-                    sys.stdout.write("\r" + c("30;103", " Comparing... %d/%d " % (done, total)) + "\x1b[K")
-                    sys.stdout.flush()
-                    if esc_pressed():
-                        self.cancel.set()
-                        break
-                h = self.hash_file(p)
-                if h:
-                    by_hash.setdefault(h, []).append(p)
-            for group in by_hash.values():
-                if len(group) > 1:
-                    for extra in group[1:]:
+            # cheap fingerprint first (start/middle/end), full hash only for matches
+            for group in self.split_by_hash(paths, sz, False):
+                for same in self.split_by_hash(group, sz, True):
+                    for extra in same[1:]:
                         dup_rows.append((extra, sz))
                         wasted += sz
+            done += len(paths)
+            sys.stdout.write("\r" + c("30;103", " Comparing... %d/%d " % (done, total)) + "\x1b[K")
+            sys.stdout.flush()
+            if esc_pressed():
+                self.cancel.set()
         dup_rows.sort(key=lambda kv: kv[1], reverse=True)
-        self.list_screen("CITRUS - duplicates (" + human(wasted) + " reclaimable, >= 1 MB)", dup_rows)
+        self.list_screen("CITRUS - duplicates (" + human(wasted) + " reclaimable, >= 1 MB)", dup_rows[:500])
+
+    def split_by_hash(self, paths, size, full):
+        by = {}
+        for p in paths:
+            if self.cancel.is_set():
+                break
+            h = self.hash_file(p) if full else self.quick_hash(p, size)
+            if h:
+                by.setdefault(h, []).append(p)
+        return [g for g in by.values() if len(g) > 1]
+
+    @staticmethod
+    def quick_hash(path, size):
+        try:
+            h = hashlib.md5()
+            with open(path, "rb") as f:
+                for pos in (0, max(0, size // 2 - 32768), max(0, size - 65536)):
+                    f.seek(pos)
+                    h.update(f.read(65536))
+            return h.hexdigest()
+        except OSError:
+            return None
 
     @staticmethod
     def hash_file(path):
