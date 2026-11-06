@@ -107,6 +107,22 @@ and reads the embedded source only when recompilation is needed.
 
 For reproducible before/after measurements, see [tests/benchmark_memory.py](tests/benchmark_memory.py).
 
+Folder measurement uses at most four workers, limited further on smaller CPUs.
+Python keeps at most one pending job per worker and polls Escape while waiting,
+including when no folder has finished. Both scanners check cancellation inside
+large directories. Windows folder workers temporarily use
+[background scheduling](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority)
+so foreground apps get preference for CPU and disk resources, restoring their
+priority when finished (CPU-priority fallback on older Windows).
+Busy or slow drives can still limit performance; the worker cap favors desktop
+responsiveness over maximum parallel I/O.
+
+The Windows ZIP checksum processes four bytes at a time using a 4 KiB lookup table
+(3 KiB more RAM, allocated only when zipping). Speed comparisons against a baseline
+build are available with `python tests/benchmark_speed.py <baseline.exe>` after
+running `build.ps1`. The benchmark uses three runs for each ZIP workload and warm
+directory metadata; it does not predict cold-drive or whole-PC responsiveness.
+
 ## 📂 Layout
 
 ```text

@@ -15,7 +15,8 @@ import shutil
 import hashlib
 import heapq
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 
 try:
@@ -191,7 +192,9 @@ def dir_size(path, cancel):
         d = stack.pop()
         try:
             with os.scandir(d) as it:
-                for e in it:
+                for index, e in enumerate(it):
+                    if index % 64 == 0 and cancel.is_set():
+                        return total
                     try:
                         if e.is_symlink():
                             continue
@@ -229,7 +232,10 @@ class App:
         results, todo = [], []
         try:
             with os.scandir(self.path) as it:
-                for e in it:
+                for index, e in enumerate(it):
+                    if index % 64 == 0 and esc_pressed():
+                        self.cancel.set()
+                        break
                     try:
                         st = e.stat(follow_symlinks=False)
                         is_dir = e.is_dir(follow_symlinks=False)
@@ -255,24 +261,45 @@ class App:
             return
 
         if todo:
-            workers = min(32, max(8, (os.cpu_count() or 4) * 4))
+            # Leave a CPU free and avoid flooding a shared disk with requests.
+            workers = min(len(todo), 4, max(1, (os.cpu_count() or 1) - 1))
             done = 0
+            last_progress = 0
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(dir_size, full, self.cancel): (row, full) for row, full in todo}
-                for fut in as_completed(futs):
-                    row, full = futs[fut]
-                    row["size"] = fut.result()
-                    if not self.cancel.is_set():
-                        self.cache[full] = row["size"]
-                    done += 1
-                    if done % 20 == 0:
+                pending = iter(todo)
+                futs = {}
+                while True:
+                    # Keep at most one outstanding job per worker, including queued jobs.
+                    while len(futs) < workers and not self.cancel.is_set():
+                        try:
+                            row, full = next(pending)
+                        except StopIteration:
+                            break
+                        futs[pool.submit(dir_size, full, self.cancel)] = (row, full)
+                    if not futs:
+                        break
+                    completed, _ = wait(futs, timeout=0.05, return_when=FIRST_COMPLETED)
+                    if not self.cancel.is_set() and esc_pressed():
+                        self.cancel.set()
+                    if self.cancel.is_set():
+                        for fut in futs:
+                            fut.cancel()
+                    for fut in completed:
+                        row, full = futs.pop(fut)
+                        if fut.cancelled():
+                            continue
+                        row["size"] = fut.result()
+                        if not self.cancel.is_set():
+                            self.cache[full] = row["size"]
+                        done += 1
+                    now = time.monotonic()
+                    if now - last_progress >= 0.1 or done == len(todo):
                         sys.stdout.write("\r" + c("30;103", " Measuring... %d/%d " % (done, len(todo))) + "\x1b[K")
                         sys.stdout.flush()
-                        if esc_pressed():
-                            self.cancel.set()
+                        last_progress = now
 
         self.entries = results
-        self.status = ""
+        self.status = "Scan cancelled - partial sizes" if self.cancel.is_set() else ""
         self.filter = ""
         self.sel = 0
         self.offset = 0
