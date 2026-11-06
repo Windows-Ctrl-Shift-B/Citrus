@@ -75,6 +75,12 @@ class WindowsTests(unittest.TestCase):
     def test_top_selection(self):
         self.probe_run('top')
 
+    def test_crc_incremental_and_partial_buffers(self):
+        self.probe_run('crc')
+
+    def test_scan_sizes_budget_and_cancellation(self):
+        self.probe_run('scan-check', self.root)
+
     def test_streamed_zip_round_trip(self):
         source = self.root / 'source'
         source.mkdir()

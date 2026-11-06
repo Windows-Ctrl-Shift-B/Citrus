@@ -41,6 +41,9 @@ static class Strata
     static readonly object CacheLock = new object();
     static volatile bool CancelScan;
 
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+    [DllImport("kernel32.dll")] static extern bool SetThreadPriority(IntPtr thread, int priority);
+
     // If any of these appears anywhere in a path, the item is off-limits.
     // Only the Windows folder tree itself is name-blocked now. Drive roots are
     // blocked separately below. Anything else Windows marks System (Recycle
@@ -204,6 +207,7 @@ static class Strata
             {
                 do
                 {
+                    if (CancelScan) return total;
                     string n = fd.cFileName;
                     if (n == "." || n == "..") continue;
                     if ((fd.dwFileAttributes & FA_REPARSE) != 0) continue;
@@ -266,15 +270,24 @@ static class Strata
         if (todo.Count > 0)
         {
             int done = 0;
-            int workers = Math.Min(32, Math.Max(8, Environment.ProcessorCount * 4));
+            // Keep disk contention and worker stacks modest, leaving a CPU available.
+            int workers = ScanWorkers(Environment.ProcessorCount);
             var task = Task.Factory.StartNew(() => Parallel.ForEach(todo,
-                new ParallelOptions { MaxDegreeOfParallelism = workers }, kv =>
+                new ParallelOptions { MaxDegreeOfParallelism = workers },
+                () => BeginScanWork(),
+                (kv, loop, priority) =>
                 {
-                    long size = DirSize(kv.Value);
-                    kv.Key.Size = size;
-                    if (!CancelScan) lock (CacheLock) Cache[kv.Value] = size;
-                    Interlocked.Increment(ref done);
-                }));
+                    if (CancelScan) loop.Stop();
+                    else
+                    {
+                        long size = DirSize(kv.Value);
+                        kv.Key.Size = size;
+                        if (!CancelScan) lock (CacheLock) Cache[kv.Value] = size;
+                        Interlocked.Increment(ref done);
+                    }
+                    return priority;
+                },
+                priority => EndScanWork(priority)));
             while (!task.IsCompleted)
             {
                 DrawProgress(done, todo.Count);
@@ -287,6 +300,24 @@ static class Strata
 
         Entries = results;
         return null;
+    }
+
+    static int ScanWorkers(int processors) { return Math.Min(4, Math.Max(1, processors - 1)); }
+
+    // Background mode lowers disk/memory scheduling as well as CPU priority.
+    // Restore the worker before returning it to the shared thread pool.
+    static int BeginScanWork()
+    {
+        if (SetThreadPriority(GetCurrentThread(), 0x10000)) return int.MinValue;
+        int previous = (int)Thread.CurrentThread.Priority; // fallback for older Windows
+        Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+        return previous;
+    }
+
+    static void EndScanWork(int previous)
+    {
+        if (previous == int.MinValue) SetThreadPriority(GetCurrentThread(), 0x20000);
+        else Thread.CurrentThread.Priority = (ThreadPriority)previous;
     }
 
     static void RebuildView()
@@ -1459,15 +1490,16 @@ static class Strata
             {
                 do
                 {
+                    if (CancelScan) return;
                     string n = fd.cFileName;
                     if (n == "." || n == "..") continue;
                     if ((fd.dwFileAttributes & FA_REPARSE) != 0) continue;
-                    string full = dir + "\\" + n;
-                    if ((fd.dwFileAttributes & FA_DIR) != 0) stack.Push(full);
+                    if ((fd.dwFileAttributes & FA_DIR) != 0) stack.Push(dir + "\\" + n);
                     else
                     {
                         long sz = ((long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-                        if (sz >= minSize) onFile(full, sz, FtToLong(fd.ftLastWriteTime));
+                        // Most files are below the threshold: allocate a path only for matches.
+                        if (sz >= minSize) onFile(dir + "\\" + n, sz, FtToLong(fd.ftLastWriteTime));
                     }
                 } while (FindNextFile(h, out fd));
             }
@@ -2453,15 +2485,29 @@ static class Strata
     {
         if (_crc == null)
         {
-            _crc = new uint[256];
+            // Slicing by four: 4 KiB of tables avoids a dependency for each byte.
+            _crc = new uint[1024];
             for (uint i = 0; i < 256; i++)
             {
                 uint x = i;
                 for (int k = 0; k < 8; k++) x = (x & 1) != 0 ? 0xEDB88320 ^ (x >> 1) : x >> 1;
                 _crc[i] = x;
             }
+            for (int i = 256; i < _crc.Length; i++)
+            {
+                uint x = _crc[i - 256];
+                _crc[i] = _crc[x & 0xFF] ^ (x >> 8);
+            }
         }
-        for (int i = 0; i < count; i++) c = _crc[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+        int offset = 0;
+        while (offset <= count - 4)
+        {
+            c ^= (uint)(data[offset] | data[offset + 1] << 8 | data[offset + 2] << 16 | data[offset + 3] << 24);
+            c = _crc[768 + (c & 0xFF)] ^ _crc[512 + ((c >> 8) & 0xFF)] ^
+                _crc[256 + ((c >> 16) & 0xFF)] ^ _crc[c >> 24];
+            offset += 4;
+        }
+        for (; offset < count; offset++) c = _crc[(c ^ data[offset]) & 0xFF] ^ (c >> 8);
         return c;
     }
     static void W16(Stream s, int v) { s.WriteByte((byte)(v & 0xFF)); s.WriteByte((byte)((v >> 8) & 0xFF)); }
