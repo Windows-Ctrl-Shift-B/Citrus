@@ -1298,12 +1298,22 @@ static class Strata
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     static extern int SHEmptyRecycleBin(IntPtr hwnd, string root, uint flags);
 
-    class Junk { public string Name; public string Path; public bool Bin; public long Size; }
+    class Junk { public string Name; public string Path; public bool Bin; public long Size; public string Mask; }
+    static char JunkKey(int i) { return i < 9 ? (char)('1' + i) : (char)('b' + i - 9); }   // 1-9 then b, c, d…
+    static int JunkIndex(char c) { c = char.ToLower(c); if (c >= '1' && c <= '9') return c - '1'; if (c >= 'b' && c <= 'z') return c - 'b' + 9; return -1; }
+    static long FreeOf(string path) { try { return new DriveInfo(Path.GetPathRoot(path)).AvailableFreeSpace; } catch { return 0; } }
+    static string FreedText(long before, string path)   // before/after summary shown after a clean
+    {
+        long after = FreeOf(path), d = after - before;
+        return "Freed " + Human(d > 0 ? d : 0) + " · " + Path.GetPathRoot(path) + " free " + Human(before) + " → " + Human(after);
+    }
 
     static List<Junk> BuildJunk()
     {
         string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
         string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string roam = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        string pdata = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
         var list = new List<Junk>
         {
             new Junk { Name = "Your temporary files",     Path = Path.GetTempPath() },
@@ -1312,11 +1322,23 @@ static class Strata
             new Junk { Name = "Chrome cache",             Path = Path.Combine(local, "Google", "Chrome", "User Data", "Default", "Cache") },
             new Junk { Name = "Edge cache",               Path = Path.Combine(local, "Microsoft", "Edge", "User Data", "Default", "Cache") },
             new Junk { Name = "Opera GX cache",           Path = Path.Combine(local, "Opera Software", "Opera GX Stable", "Cache") },
-            new Junk { Name = "Recycle Bin",              Path = "", Bin = true },
+            new Junk { Name = "Brave cache",              Path = Path.Combine(local, "BraveSoftware", "Brave-Browser", "User Data", "Default", "Cache") },
+            new Junk { Name = "Discord cache",            Path = Path.Combine(roam, "discord", "Cache") },
+            new Junk { Name = "NVIDIA shader cache",      Path = Path.Combine(local, "NVIDIA", "DXCache") },
+            new Junk { Name = "AMD shader cache",         Path = Path.Combine(local, "AMD", "DxCache") },
+            new Junk { Name = "DirectX shader cache",     Path = Path.Combine(local, "D3DSCache") },
+            new Junk { Name = "App crash dumps",          Path = Path.Combine(local, "CrashDumps") },
+            new Junk { Name = "Error reports (WER)",      Path = Path.Combine(pdata, "Microsoft", "Windows", "WER", "ReportArchive") },
+            new Junk { Name = "Thumbnail cache",          Path = Path.Combine(local, "Microsoft", "Windows", "Explorer"), Mask = "thumbcache_*.db" },
         };
+        try { foreach (var prof in Directory.GetDirectories(Path.Combine(local, "Mozilla", "Firefox", "Profiles")))
+                list.Add(new Junk { Name = "Firefox cache (" + Path.GetFileName(prof) + ")", Path = Path.Combine(prof, "cache2") }); } catch { }
+        list.RemoveAll(j => !Directory.Exists(j.Path));   // only show what this PC actually has
+        list.Add(new Junk { Name = "Recycle Bin", Path = "", Bin = true });
         foreach (var j in list)
         {
             if (j.Bin) { var info = new SHQUERYRBINFO(); info.cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO)); if (SHQueryRecycleBin(null, ref info) == 0) j.Size = info.i64Size; }
+            else if (j.Mask != null) { try { foreach (var f in new DirectoryInfo(j.Path).GetFiles(j.Mask)) j.Size += f.Length; } catch { } }
             else if (Directory.Exists(j.Path)) j.Size = DirSize(j.Path);
         }
         return list;
@@ -1328,7 +1350,7 @@ static class Strata
         if (!Directory.Exists(j.Path)) return;
         try
         {
-            foreach (var e in Directory.EnumerateFileSystemEntries(j.Path))
+            foreach (var e in j.Mask != null ? Directory.EnumerateFiles(j.Path, j.Mask) : Directory.EnumerateFileSystemEntries(j.Path))
             {
                 try
                 {
@@ -1345,6 +1367,7 @@ static class Strata
     static void JunkScreen()
     {
         var items = BuildJunk();
+        string root = Environment.GetFolderPath(Environment.SpecialFolder.Windows), done = null;
         while (true)
         {
             int cols = Cols;
@@ -1352,14 +1375,14 @@ static class Strata
             Console.BackgroundColor = ConsoleColor.DarkMagenta; Console.ForegroundColor = ConsoleColor.White;
             Line(" CITRUS — Junk Cleaner"); Console.ResetColor();
             Console.ForegroundColor = ConsoleColor.Gray;
-            Line(" Press a number to clear that item · A = clear everything · Esc = back");
+            Line(" Press an item's key to clear it · A = clear everything · Esc = back");
             Console.ForegroundColor = ConsoleColor.DarkGray; Line(new string('─', cols - 1)); Console.ResetColor();
 
             long tot = 0;
             for (int i = 0; i < items.Count; i++)
             {
                 var j = items[i];
-                W("   " + (i + 1) + "  ", ConsoleColor.Cyan);
+                W("   " + JunkKey(i) + "  ", ConsoleColor.Cyan);
                 W(Fit(j.Name, 30), ConsoleColor.White);
                 W(Human(j.Size).PadLeft(12), j.Size > 0 ? ConsoleColor.Yellow : ConsoleColor.DarkGray);
                 Console.WriteLine();
@@ -1367,6 +1390,7 @@ static class Strata
             }
             Console.WriteLine();
             W("   Reclaimable total: ", ConsoleColor.Gray); W(Human(tot) + "\n", ConsoleColor.Green);
+            if (done != null) W("   " + done + "\n", ConsoleColor.Cyan);
             // pad rest of screen
             for (int r = Console.CursorTop; r < Rows - 1; r++) Line("");
 
@@ -1377,16 +1401,16 @@ static class Strata
                 if (ev.Ch == 'a' || ev.Ch == 'A')
                 {
                     if (ConfirmBar("Clear ALL junk (" + Human(tot) + ")? Temp/cache files are removed permanently.", "YES, CLEAR ALL"))
-                    { foreach (var j in items) CleanJunk(j); ForgetCache(CurrentPath); items = BuildJunk(); }
+                    { long b = FreeOf(root); foreach (var j in items) CleanJunk(j); ForgetCache(CurrentPath); items = BuildJunk(); done = FreedText(b, root); }
                 }
-                else if (ev.Ch >= '1' && ev.Ch <= '9')
+                else if (JunkIndex(ev.Ch) >= 0)
                 {
-                    int k = ev.Ch - '1';
+                    int k = JunkIndex(ev.Ch);
                     if (k < items.Count)
                     {
                         var j = items[k];
                         string how = j.Bin ? "Empty the Recycle Bin permanently?" : "Clear " + j.Name + " (" + Human(j.Size) + ") permanently?";
-                        if (ConfirmBar(how, "YES, CLEAR")) { CleanJunk(j); items = BuildJunk(); }
+                        if (ConfirmBar(how, "YES, CLEAR")) { long b = FreeOf(root); CleanJunk(j); items = BuildJunk(); done = FreedText(b, root); }
                     }
                 }
             }
@@ -1397,7 +1421,7 @@ static class Strata
                 {
                     var j = items[row];
                     string how = j.Bin ? "Empty the Recycle Bin permanently?" : "Clear " + j.Name + " (" + Human(j.Size) + ") permanently?";
-                    if (ConfirmBar(how, "YES, CLEAR")) { CleanJunk(j); items = BuildJunk(); }
+                    if (ConfirmBar(how, "YES, CLEAR")) { long b = FreeOf(root); CleanJunk(j); items = BuildJunk(); done = FreedText(b, root); }
                 }
             }
         }
@@ -2023,6 +2047,41 @@ static class Strata
         ListScreen("CITRUS — big old files (≥ 1 MB, 1+ year old)", files, "No big old files here.");
     }
 
+    // Old installers, disk images and archives in Downloads/Desktop, plus any huge download (>= 500 MB).
+    static readonly string[] InstallerExts = { ".exe", ".msi", ".msix", ".appx", ".iso", ".img", ".zip", ".rar", ".7z", ".cab", ".dmg", ".torrent" };
+    static void InstallersScreen()
+    {
+        Console.ResetColor(); Console.Clear();
+        Console.BackgroundColor = ConsoleColor.DarkBlue; Console.ForegroundColor = ConsoleColor.White; Line(" CITRUS — old installers & big downloads"); Console.ResetColor();
+        Console.WriteLine(); W("   Looking in Downloads and Desktop…\n", ConsoleColor.DarkGray);
+        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var files = new List<KeyValuePair<string, long>>();
+        long tot = 0;
+        foreach (var root in new[] { Path.Combine(home, "Downloads"), Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory) })
+        {
+            if (!Directory.Exists(root)) continue;
+            var stack = new Stack<string>(); stack.Push(root);
+            while (stack.Count > 0)
+            {
+                string d = stack.Pop();
+                try
+                {
+                    foreach (var sub in Directory.EnumerateDirectories(d))
+                        try { if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) == 0) stack.Push(sub); } catch { }
+                    foreach (var f in new DirectoryInfo(d).EnumerateFiles())
+                    {
+                        long sz = f.Length;
+                        bool inst = Array.IndexOf(InstallerExts, f.Extension.ToLowerInvariant()) >= 0;
+                        if ((inst && sz >= 1024L * 1024) || sz >= 500L * 1024 * 1024) { KeepLargest(files, f.FullName, sz, 500); tot += sz; }
+                    }
+                }
+                catch { }
+            }
+        }
+        files.Sort((a, b) => b.Value.CompareTo(a.Value));
+        ListScreen("CITRUS — old installers & big downloads (" + Human(tot) + ")", files, "No installers, ISOs, archives or huge downloads found.");
+    }
+
     static string TextInput(string prompt)
     {
         string s = "";
@@ -2284,6 +2343,7 @@ static class Strata
 
     static void LocationCleaner(string title, List<string[]> locs)  // locs: [name, path]
     {
+        string done = null, root = locs[0][1];
         while (true)
         {
             var sizes = new List<long>();
@@ -2303,6 +2363,7 @@ static class Strata
             }
             Console.WriteLine();
             W("   Reclaimable total: " + Human(tot) + "   (Esc back)\n", ConsoleColor.Green); Console.ResetColor();
+            if (done != null) W("   " + done + "\n", ConsoleColor.Cyan);
             for (int r = Console.CursorTop; r < Rows - 1; r++) Line("");
             var ev = ReadEvent();
             if (ev.Kind == Ev.Key)
@@ -2311,13 +2372,13 @@ static class Strata
                 if (ev.Ch == 'a' || ev.Ch == 'A')
                 {
                     if (ConfirmBar("Clear ALL of these (" + Human(tot) + ")? Removed permanently.", "Enter = YES"))
-                    { foreach (var l in locs) CleanLocation(l[1]); }
+                    { long b = FreeOf(root); foreach (var l in locs) CleanLocation(l[1]); done = FreedText(b, root); }
                 }
                 else if (ev.Ch >= '1' && ev.Ch <= '9')
                 {
                     int k = ev.Ch - '1';
                     if (k < locs.Count && ConfirmBar("Clear " + locs[k][0] + " (" + Human(sizes[k]) + ") permanently?", "Enter = YES"))
-                        CleanLocation(locs[k][1]);
+                    { long b = FreeOf(root); CleanLocation(locs[k][1]); done = FreedText(b, root); }
                 }
             }
         }
@@ -2831,6 +2892,7 @@ static class Strata
             case 15: ExportReport(); break;
             case 16: SaveSnapshot(); break;
             case 17: CompareSnapshot(); break;
+            case 18: InstallersScreen(); break;
         }
     }
 
@@ -2843,6 +2905,7 @@ static class Strata
         new[] { "d", "Search whole drive", "3" },
         new[] { "", "CLEAN UP", "-1" },
         new[] { "e", "Empty folders", "4" },
+        new[] { "t", "Old installers/downloads", "18" },
         new[] { "f", "Windows deep-clean", "5" },
         new[] { "g", "Undo last delete", "6" },
         new[] { "h", "Secure-wipe free space", "7" },

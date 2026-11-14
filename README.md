@@ -52,7 +52,8 @@ Grab **[`Citrus.cmd`](Citrus.cmd)** — that one file *is* the whole app on ever
 - 🔀 Filter as you type · sort by size / name / newest
 
 **Clean up**
-- 🧹 **Junk cleaner** — temp files, browser caches, Recycle Bin
+- 🧹 **Junk cleaner** — temp files, browser caches (Chrome/Edge/Firefox/Brave/Opera GX), Discord, GPU shader caches, crash dumps, thumbnails, Recycle Bin — shows space freed and drive free before → after
+- 📥 **Old installers & big downloads** — installers, ISOs, archives and 500 MB+ files in Downloads/Desktop
 - 🪟 **Windows deep-clean** — `Windows.old`, Update cache, Delivery Optimization, crash dumps
 - 📭 Empty-folder finder · 🔒 secure free-space wipe (`cipher`)
 - 🗑️ Everything deletes to the **Recycle Bin / Trash** — with **system-file protection**, **multi-select**, and **undo**
